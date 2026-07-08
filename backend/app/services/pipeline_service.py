@@ -8,10 +8,20 @@ import httpx
 from fastapi import HTTPException
 
 from app.core.config import settings
-from app.mock.transcripts import MOCK_TRANSCRIPTS
 
 
 GENERATED_DIR = Path(settings.storage_local_dir) / "generated"
+
+
+# Simple fallback transcript list, used when no API key is configured.
+# Allows the prototype to be demoed without external credentials.
+FALLBACK_TRANSCRIPTS: list[str] = [
+    "妈妈我今天想听小熊的故事。",
+    "我有点困了,可以关灯吗?",
+    "能再讲一遍刚才那个吗?",
+    "爸爸什么时候回来呀?",
+    "我做了一个梦,梦到云朵上面。",
+]
 
 
 def _response_text(payload) -> str:
@@ -130,8 +140,11 @@ async def transcribe_audio(audio: bytes, filename: str, content_type: str) -> di
     endpoint = settings.audio_transcription_endpoint.strip()
 
     if not api_key or not api_base_url:
-        idx = len(audio) % len(MOCK_TRANSCRIPTS)
-        return {"transcript": MOCK_TRANSCRIPTS[idx], "raw": {"provider": "mock", "size": len(audio)}}
+        idx = len(audio) % len(FALLBACK_TRANSCRIPTS)
+        return {
+            "transcript": FALLBACK_TRANSCRIPTS[idx],
+            "raw": {"provider": "fallback", "size": len(audio)},
+        }
 
     if not endpoint:
         endpoint = f"{api_base_url}/v1/audio/transcriptions"
@@ -161,11 +174,17 @@ async def transcribe_audio(audio: bytes, filename: str, content_type: str) -> di
     try:
         data = response.json()
     except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=502, detail=f"Transcription API returned non-JSON response: {response.text[:300]}") from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"Transcription API returned non-JSON response: {response.text[:300]}",
+        ) from exc
 
     transcript = _response_text(data)
     if not transcript:
-        raise HTTPException(status_code=502, detail=f"Transcription API response did not contain text: {json.dumps(data, ensure_ascii=False)[:500]}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Transcription API response did not contain text: {json.dumps(data, ensure_ascii=False)[:500]}",
+        )
     return {"transcript": transcript, "raw": data}
 
 
@@ -176,7 +195,7 @@ async def generate_wallpaper(transcript: str) -> dict:
     prompt = _build_wallpaper_prompt(transcript)
 
     if not api_key or not api_base_url:
-        return {"imageUrl": "", "raw": {"provider": "mock", "prompt": prompt}}
+        return {"imageUrl": "", "raw": {"provider": "fallback", "prompt": prompt}}
 
     if not endpoint:
         endpoint = f"{api_base_url}/v1/chat/completions"
@@ -202,11 +221,17 @@ async def generate_wallpaper(transcript: str) -> dict:
             data = response.json()
             refs = _collect_image_refs(data)
             if not refs:
-                raise HTTPException(status_code=502, detail=f"Image API response did not contain image data: {json.dumps(data, ensure_ascii=False)[:600]}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Image API response did not contain image data: {json.dumps(data, ensure_ascii=False)[:600]}",
+                )
             image_url = await _save_image_ref(refs[0], client)
             return {"imageUrl": image_url, "raw": data}
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=502, detail=f"Image API HTTP {exc.response.status_code}: {exc.response.text[:800]}") from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"Image API HTTP {exc.response.status_code}: {exc.response.text[:800]}",
+        ) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Image API request failed: {exc}") from exc
     except (ValueError, json.JSONDecodeError) as exc:

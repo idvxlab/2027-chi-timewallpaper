@@ -1,0 +1,1 @@
+{"detail":"Gemini generation failed: Gemini API error 400: {\"error\":{\"message\":\"The input token count exceeds the maximum number of tokens allowed (32768).\",\"type\":\"new_api_error\",\"param\":\"\",\"code\":400}}"}

@@ -6,10 +6,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.cors import build_cors_origins
-from app.db.session import Base, engine
-# noqa: 让 SQLAlchemy 知道要创建哪些表
-import app.db.models  # noqa: F401
-from app.routes import scene, demo, touch, asr, logs, ws
+from app.routes import asr, wallpaper
 
 
 def create_app() -> FastAPI:
@@ -27,16 +24,8 @@ def create_app() -> FastAPI:
     generated_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/generated", StaticFiles(directory=generated_dir), name="generated")
 
-    @app.on_event("startup")
-    async def _init_db() -> None:
-        Base.metadata.create_all(bind=engine)
-
-    app.include_router(scene.router, prefix="/scene", tags=["scene"])
-    app.include_router(demo.router, prefix="/demo", tags=["demo"])
-    app.include_router(touch.router, prefix="/touch", tags=["touch"])
     app.include_router(asr.router, prefix="/asr", tags=["asr"])
-    app.include_router(logs.router, prefix="/logs", tags=["logs"])
-    app.include_router(ws.router, tags=["ws"])
+    app.include_router(wallpaper.router, prefix="/generate-wallpaper", tags=["wallpaper"])
 
     @app.get("/health")
     async def health() -> dict[str, str]:
