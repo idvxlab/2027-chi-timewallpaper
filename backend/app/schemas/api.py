@@ -17,6 +17,8 @@ class _CamelModel(BaseModel):
 class TouchIn(_CamelModel):
     hotspot_id: str
     demo_id: Optional[str] = None
+    user_id: Optional[str] = None
+    relationship_id: Optional[str] = None
     payload: dict = Field(default_factory=dict)
 
 

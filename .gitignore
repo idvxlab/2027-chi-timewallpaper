@@ -6,3 +6,14 @@ frontend/node_modules/
 .next/
 dist/
 build/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite
+*.sqlite3
+*.tsbuildinfo
+backend/data/app.db
+backend/data/uploads/generated/
+backend/data/uploads/references/

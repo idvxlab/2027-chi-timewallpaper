@@ -1,18 +1,32 @@
+import uuid
+
 from app.core.scene_store import SceneStore
 from app.db.session import SessionLocal
-from app.db.models import TouchLog
+from app.db.models import InteractionLog, TouchLog
 from app.mock.messages import CUE_BY_HOTSPOT, MESSAGE_BY_HOTSPOT
 from app.schemas.api import TouchIn, TouchOut
+from app.services.user_context import normalize_user_context
 
 
 def _persist_touch(body: TouchIn) -> None:
     """同步写 SQLite 日志。失败不影响主流程。"""
     try:
+        user_id, relationship_id = normalize_user_context(body.user_id, body.relationship_id)
         with SessionLocal() as s:
             s.add(
                 TouchLog(
                     hotspot_id=body.hotspot_id,
                     demo_id=body.demo_id,
+                    payload=body.payload or {},
+                )
+            )
+            s.add(
+                InteractionLog(
+                    interaction_id=uuid.uuid4().hex,
+                    user_id=user_id,
+                    relationship_id=relationship_id,
+                    interaction_type="touch",
+                    target_id=body.hotspot_id,
                     payload=body.payload or {},
                 )
             )

@@ -41,15 +41,33 @@ export type UploadAudioResult = {
   raw?: unknown;
 };
 
+type AgentRunAudioResponse = {
+  runId: string;
+  status: string;
+  result?: {
+    languageEmotion?: {
+      transcript?: string;
+    };
+    imageGeneration?: {
+      wallpaperUrl?: string;
+    };
+  };
+};
+
 export async function uploadAudio(blob: Blob): Promise<UploadAudioResult> {
   const form = new FormData();
   form.append("audio", blob, `voice-${Date.now()}.wav`);
-  const res = await fetch(`${API_BASE}/asr`, { method: "POST", body: form });
+  const res = await fetch(`${API_BASE}/agent-runs/audio`, { method: "POST", body: form });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
-    throw new Error(`ASR HTTP ${res.status}: ${detail || res.statusText}`);
+    throw new Error(`Agent run HTTP ${res.status}: ${detail || res.statusText}`);
   }
-  const result = (await res.json()) as UploadAudioResult;
+  const payload = (await res.json()) as AgentRunAudioResponse;
+  const result: UploadAudioResult = {
+    transcript: payload.result?.languageEmotion?.transcript ?? "",
+    imageUrl: payload.result?.imageGeneration?.wallpaperUrl ?? "",
+    raw: payload,
+  };
   return {
     ...result,
     imageUrl: result.imageUrl ? absoluteApiUrl(result.imageUrl) : "",

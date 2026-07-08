@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import json
 import re
@@ -12,6 +14,7 @@ from app.mock.transcripts import MOCK_TRANSCRIPTS
 
 
 GENERATED_DIR = Path(settings.storage_local_dir) / "generated"
+REFERENCES_DIR = Path(settings.storage_local_dir) / "references"
 
 
 def _response_text(payload) -> str:
@@ -80,6 +83,12 @@ def _collect_image_refs(value) -> list[str]:
             refs.extend(_collect_image_refs(item))
         return refs
     if isinstance(value, dict):
+        inline_data = value.get("inlineData") or value.get("inline_data")
+        if isinstance(inline_data, dict):
+            data = inline_data.get("data")
+            mime_type = inline_data.get("mimeType") or inline_data.get("mime_type") or "image/png"
+            if isinstance(data, str) and data.strip():
+                refs.append(f"data:{mime_type};base64,{data.strip()}")
         for key in ("url", "image_url", "b64_json", "base64", "data"):
             if key in value:
                 refs.extend(_collect_image_refs(value[key]))
@@ -101,6 +110,50 @@ def _image_extension(content_type: str, fallback: str = "png") -> str:
     return fallback
 
 
+def _image_mime_from_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".webp":
+        return "image/webp"
+    if suffix == ".gif":
+        return "image/gif"
+    return "image/png"
+
+
+def _local_static_image_path(ref: str) -> Path | None:
+    clean_ref = ref.split("?", 1)[0].strip()
+    if clean_ref.startswith("/generated/"):
+        return GENERATED_DIR / clean_ref.removeprefix("/generated/")
+    if clean_ref.startswith("/references/"):
+        return REFERENCES_DIR / clean_ref.removeprefix("/references/")
+    return None
+
+
+def _image_ref_for_upstream(ref: str) -> str:
+    ref = ref.strip()
+    if not ref:
+        return ref
+    if ref.startswith(("data:image/", "http://", "https://")):
+        return ref
+    local_path = _local_static_image_path(ref)
+    if local_path and local_path.exists():
+        encoded = base64.b64encode(local_path.read_bytes()).decode("ascii")
+        return f"data:{_image_mime_from_path(local_path)};base64,{encoded}"
+    return ref
+
+
+def _inline_image_part(ref: str) -> dict | None:
+    ref = ref.strip()
+    if ref.startswith("data:image/") and ";base64," in ref:
+        header, encoded = ref.split(",", 1)
+        mime_type = header.removeprefix("data:").split(";", 1)[0] or "image/png"
+        return {"inlineData": {"mimeType": mime_type, "data": re.sub(r"\s+", "", encoded)}}
+    if len(ref) > 500 and re.fullmatch(r"[A-Za-z0-9+/=\s]+", ref):
+        return {"inlineData": {"mimeType": "image/png", "data": re.sub(r"\s+", "", ref)}}
+    return None
+
+
 async def _save_image_ref(ref: str, client: httpx.AsyncClient) -> str:
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
     ref = ref.strip().strip('"').strip("'")
@@ -110,7 +163,7 @@ async def _save_image_ref(ref: str, client: httpx.AsyncClient) -> str:
         ext = _image_extension(header)
         data = base64.b64decode(encoded)
     elif ref.startswith("http://") or ref.startswith("https://"):
-        response = await client.get(ref, timeout=60)
+        response = await client.get(ref, timeout=settings.image_download_timeout_seconds)
         response.raise_for_status()
         ext = _image_extension(response.headers.get("content-type", ""))
         data = response.content
@@ -124,9 +177,9 @@ async def _save_image_ref(ref: str, client: httpx.AsyncClient) -> str:
     return f"/generated/{filename}"
 
 
-async def transcribe_audio(audio: bytes, filename: str, content_type: str) -> dict:
-    api_key = settings.audio_api_key
-    api_base_url = settings.audio_api_base_url.rstrip("/")
+async def transcribe_audio(audio: bytes, filename: str, content_type: str, run_id: str | None = None) -> dict:
+    api_key = settings.effective_audio_api_key
+    api_base_url = settings.effective_audio_api_base_url.rstrip("/")
     endpoint = settings.audio_transcription_endpoint.strip()
 
     if not api_key or not api_base_url:
@@ -137,6 +190,7 @@ async def transcribe_audio(audio: bytes, filename: str, content_type: str) -> di
         endpoint = f"{api_base_url}/v1/audio/transcriptions"
 
     try:
+        _log(run_id, f"ASR upstream request model={settings.audio_transcription_model} endpoint={endpoint}")
         async with httpx.AsyncClient(timeout=45) as client:
             response = await client.post(
                 endpoint,
@@ -150,13 +204,17 @@ async def transcribe_audio(audio: bytes, filename: str, content_type: str) -> di
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             response.raise_for_status()
+            _log(run_id, f"ASR upstream response status={response.status_code}")
     except httpx.HTTPStatusError as exc:
         raise HTTPException(
             status_code=502,
             detail=f"Transcription API HTTP {exc.response.status_code}: {exc.response.text[:500]}",
         ) from exc
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Transcription API request failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"Transcription API request failed ({type(exc).__name__}): {repr(exc)}",
+        ) from exc
 
     try:
         data = response.json()
@@ -170,47 +228,115 @@ async def transcribe_audio(audio: bytes, filename: str, content_type: str) -> di
 
 
 async def generate_wallpaper(transcript: str) -> dict:
-    api_key = settings.image_api_key or settings.audio_api_key
-    api_base_url = (settings.image_api_base_url or settings.audio_api_base_url).rstrip("/")
+    return await generate_wallpaper_from_prompt(_build_wallpaper_prompt(transcript))
+
+
+async def generate_wallpaper_from_prompt(
+    prompt: str,
+    run_id: str | None = None,
+    reference_image_urls: list[str] | None = None,
+) -> dict:
+    api_key = settings.effective_image_api_key
+    api_base_url = settings.effective_image_api_base_url.rstrip("/")
     endpoint = settings.image_chat_endpoint.strip()
-    prompt = _build_wallpaper_prompt(transcript)
 
     if not api_key or not api_base_url:
         return {"imageUrl": "", "raw": {"provider": "mock", "prompt": prompt}}
 
-    if not endpoint:
-        endpoint = f"{api_base_url}/v1/chat/completions"
+    resolved_refs = [_image_ref_for_upstream(url) for url in (reference_image_urls or []) if url]
+    is_gemini_generate_content = (
+        settings.image_chat_model == "gemini-2.5-flash-image"
+        or "generateContent" in endpoint
+    )
+    if is_gemini_generate_content:
+        if not endpoint:
+            endpoint = f"{api_base_url}/v1beta/models/{settings.image_chat_model}:generateContent"
+        payload = _build_gemini_image_payload(prompt, resolved_refs)
+    else:
+        if not endpoint:
+            endpoint = f"{api_base_url}/v1/images/generations"
+        payload = {
+            "model": settings.image_chat_model,
+            "prompt": prompt,
+            "aspect_ratio": settings.image_aspect_ratio,
+        }
+        if resolved_refs:
+            payload["image"] = resolved_refs
 
-    payload = {
-        "model": settings.image_chat_model,
-        "stream": False,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=180) as client:
-            response = await client.post(
-                endpoint,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
+    timeout_seconds = settings.image_request_timeout_seconds
+    attempts = max(1, settings.image_request_retries + 1)
+    timeout = httpx.Timeout(timeout_seconds, connect=30, read=timeout_seconds, write=60, pool=30)
+    for attempt in range(1, attempts + 1):
+        try:
+            _log(
+                run_id,
+                f"Image upstream request model={settings.image_chat_model} endpoint={endpoint} prompt_chars={len(prompt)} refs={len(resolved_refs)} protocol={'gemini_generate_content' if is_gemini_generate_content else 'images_generations'} timeout={timeout_seconds}s attempt={attempt}/{attempts}",
             )
-            response.raise_for_status()
-            data = response.json()
-            refs = _collect_image_refs(data)
-            if not refs:
-                raise HTTPException(status_code=502, detail=f"Image API response did not contain image data: {json.dumps(data, ensure_ascii=False)[:600]}")
-            image_url = await _save_image_ref(refs[0], client)
-            return {"imageUrl": image_url, "raw": data}
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=502, detail=f"Image API HTTP {exc.response.status_code}: {exc.response.text[:800]}") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Image API request failed: {exc}") from exc
-    except (ValueError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=502, detail=f"Image API parse failed: {exc}") from exc
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(
+                    endpoint,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                )
+                response.raise_for_status()
+                _log(run_id, f"Image upstream response status={response.status_code}")
+                data = response.json()
+                refs = _collect_image_refs(data)
+                _log(run_id, f"Image refs collected count={len(refs)}")
+                if not refs:
+                    raise HTTPException(status_code=502, detail=f"Image API response did not contain image data: {json.dumps(data, ensure_ascii=False)[:600]}")
+                image_url = await _save_image_ref(refs[0], client)
+                _log(run_id, f"Image saved url={image_url}")
+                return {"imageUrl": image_url, "raw": data}
+        except httpx.ReadTimeout as exc:
+            _log(run_id, f"Image upstream read timeout attempt={attempt}/{attempts} timeout={timeout_seconds}s")
+            if attempt < attempts:
+                continue
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"Image API timed out after {timeout_seconds}s. "
+                    "The upstream image model may still be queued or overloaded. "
+                    "You can increase IMAGE_REQUEST_TIMEOUT_SECONDS, retry later, or switch to a dedicated SD/ComfyUI image provider."
+                ),
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(status_code=502, detail=f"Image API HTTP {exc.response.status_code}: {exc.response.text[:800]}") from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Image API request failed ({type(exc).__name__}): {repr(exc)}",
+            ) from exc
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=502, detail=f"Image API parse failed: {exc}") from exc
+
+
+def _build_gemini_image_payload(prompt: str, resolved_refs: list[str]) -> dict:
+    parts: list[dict] = []
+    for ref in resolved_refs:
+        part = _inline_image_part(ref)
+        if part:
+            parts.append(part)
+    parts.append({"text": prompt})
+    return {
+        "contents": [
+            {
+                "role": "user",
+                "parts": parts,
+            }
+        ],
+        "generationConfig": {
+            "imageConfig": {
+                "aspectRatio": settings.image_aspect_ratio,
+                "imageSize": settings.image_size,
+            },
+            "responseModalities": ["IMAGE"],
+        },
+    }
 
 
 async def recognize_audio(audio: bytes, content_type: str, filename: str = "recording.wav") -> dict:
@@ -221,3 +347,8 @@ async def recognize_audio(audio: bytes, content_type: str, filename: str = "reco
         "imageUrl": image.get("imageUrl", ""),
         "raw": {"asr": asr.get("raw"), "image": image.get("raw")},
     }
+
+
+def _log(run_id: str | None, message: str) -> None:
+    prefix = f"[agent-run:{run_id}]" if run_id else "[agent-run]"
+    print(f"{prefix} {message}", flush=True)
