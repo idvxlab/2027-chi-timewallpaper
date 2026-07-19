@@ -1,10 +1,35 @@
 from __future__ import annotations
 
+from app.core.config import settings
 from app.schemas.agent import ImageGenerationResult, SemanticMappingResult
+from app.services.layered_painter_tools import layered_painter_tools
 from app.services.pipeline_service import generate_wallpaper_from_prompt
 
 
 class ImageGenerationAgent:
+    async def run_base_scene(self, run_id: str | None = None) -> ImageGenerationResult:
+        self._log(run_id, "painter tool selector: tool=base_scene_only")
+        result = await layered_painter_tools.generate_base_scene()
+        wallpaper_url = result.get("imageUrl") or ""
+        if wallpaper_url:
+            self._log(run_id, f"painter base scene done imageUrl={wallpaper_url}")
+        else:
+            self._log(run_id, "painter base scene tool returned empty image")
+        return ImageGenerationResult(
+            wallpaper_url=wallpaper_url,
+            generation_mode="layered_painter_tool:base_scene_only",
+            changed_regions=["base_scene"],
+            asset_metadata={
+                "layered_tool": "base_scene_only",
+                "raw": result.get("raw"),
+                "quality": {
+                    "mode": "base_scene_tool",
+                    "painter_owns_tool_selection": True,
+                    "no_characters_required": True,
+                },
+            },
+        )
+
     async def run(
         self,
         semantic_mapping: SemanticMappingResult,
@@ -33,6 +58,18 @@ class ImageGenerationAgent:
         reference_urls = self._reference_urls(role_reference_images)
         if reference_urls:
             self._log(run_id, f"image reference inputs roles={','.join(reference_urls.keys())}")
+        layered = await self._try_layered_painter_tool(
+            semantic_mapping=semantic_mapping,
+            prompt=prompt,
+            previous_image_url=previous_image_url,
+            role_reference_images=role_reference_images,
+            regions=regions,
+            masks=masks,
+            run_id=run_id,
+        )
+        if layered is not None:
+            return layered
+
         image = await generate_wallpaper_from_prompt(
             prompt,
             run_id=run_id,
@@ -57,6 +94,142 @@ class ImageGenerationAgent:
                     "composition_consistency_required": bool(previous_image_url),
                 },
             },
+        )
+
+    async def _try_layered_painter_tool(
+        self,
+        *,
+        semantic_mapping: SemanticMappingResult,
+        prompt: str,
+        previous_image_url: str | None,
+        role_reference_images: dict[str, str | None] | None,
+        regions: list[dict],
+        masks: list[dict],
+        run_id: str | None,
+    ) -> ImageGenerationResult | None:
+        if not settings.layered_image_tools_enabled:
+            self._log(run_id, "painter tool selector: fallback=single_prompt_image_api reason=layered_tools_disabled")
+            return None
+
+        tool_name = self._select_layered_tool(previous_image_url, role_reference_images)
+        if tool_name is None:
+            self._log(run_id, "painter tool selector: fallback=single_prompt_image_api reason=missing_layered_inputs")
+            return None
+
+        self._log(run_id, f"painter tool selector: tool={tool_name}")
+        try:
+            current_role = self._current_role(semantic_mapping)
+            if tool_name == "base_scene_then_first_voice_compose":
+                refs = self._reference_urls(role_reference_images)
+                elder_bytes = await layered_painter_tools.resolve_reference_bytes(refs.get("elder"))
+                child_bytes = await layered_painter_tools.resolve_reference_bytes(refs.get("child"))
+                base_result = await layered_painter_tools.generate_base_scene(
+                    self_image_bytes=child_bytes,
+                    partner_image_bytes=elder_bytes,
+                )
+                base_image_url = base_result.get("imageUrl") or ""
+                if not base_image_url:
+                    self._log(run_id, "painter base scene tool returned empty image; fallback=single_prompt_image_api")
+                    return None
+                self._log(run_id, f"painter base scene done imageUrl={base_image_url}")
+                insert_result = await layered_painter_tools.first_voice_compose(
+                    base_image_url=base_image_url,
+                    younger_image_bytes=child_bytes,
+                    elder_image_bytes=elder_bytes,
+                    transcript=self._layered_tool_message(semantic_mapping),
+                    current_role=current_role,
+                )
+                result = {
+                    "imageUrl": insert_result.get("imageUrl") or base_image_url,
+                    "raw": {
+                        "baseScene": base_result.get("raw"),
+                        "insertCharacters": insert_result.get("raw"),
+                    },
+                }
+            elif tool_name == "first_voice_compose":
+                refs = self._reference_urls(role_reference_images)
+                result = await layered_painter_tools.first_voice_compose(
+                    base_image_url=previous_image_url or "",
+                    younger_image_bytes=await layered_painter_tools.resolve_reference_bytes(refs.get("child")),
+                    elder_image_bytes=await layered_painter_tools.resolve_reference_bytes(refs.get("elder")),
+                    transcript=self._layered_tool_message(semantic_mapping),
+                    current_role=current_role,
+                )
+            elif tool_name == "update_current_side":
+                result = await layered_painter_tools.update_current_side(
+                    base_image_url=previous_image_url or "",
+                    transcript=self._layered_tool_message(semantic_mapping),
+                    current_side="left_bottom",
+                )
+            else:
+                return None
+        except Exception as exc:
+            self._log(run_id, f"painter layered tool failed tool={tool_name} error={exc}; fallback=single_prompt_image_api")
+            return None
+
+        wallpaper_url = result.get("imageUrl") or previous_image_url or ""
+        if not wallpaper_url:
+            self._log(run_id, f"painter layered tool returned empty image tool={tool_name}; fallback=single_prompt_image_api")
+            return None
+
+        return ImageGenerationResult(
+            wallpaper_url=wallpaper_url,
+            generation_mode=f"layered_painter_tool:{tool_name}",
+            changed_regions=[region["region_id"] for region in regions],
+            asset_metadata={
+                "parent_image": previous_image_url,
+                "regions": regions,
+                "masks": masks,
+                "prompt": prompt,
+                "layered_tool": tool_name,
+                "role_references": self._reference_urls(role_reference_images),
+                "raw": result.get("raw"),
+                "quality": {
+                    "mode": "layered_tool_with_prompt_fallback",
+                    "designer_output_only": True,
+                    "painter_owns_tool_selection": True,
+                },
+            },
+        )
+
+    def _select_layered_tool(
+        self,
+        previous_image_url: str | None,
+        role_reference_images: dict[str, str | None] | None,
+    ) -> str | None:
+        refs = self._reference_urls(role_reference_images)
+        if not previous_image_url and refs.get("elder") and refs.get("child"):
+            return "base_scene_then_first_voice_compose"
+        if previous_image_url and refs.get("elder") and refs.get("child"):
+            return "first_voice_compose"
+        if previous_image_url:
+            return "update_current_side"
+        return None
+
+    def _current_role(self, semantic_mapping: SemanticMappingResult) -> str:
+        scaffold = semantic_mapping.cognitive_scaffold or {}
+        role = str(scaffold.get("viewerRole") or scaffold.get("viewer_role") or "parent").lower()
+        if role in {"child", "daughter", "son"}:
+            return "child"
+        return "parent"
+
+    def _layered_tool_message(self, semantic_mapping: SemanticMappingResult) -> str:
+        plan = semantic_mapping.cognitive_scaffold or {}
+        five_layers = plan.get("fiveLayerPlan") or {}
+        layer_lines = []
+        for key, layer in five_layers.items():
+            if not isinstance(layer, dict):
+                continue
+            content = layer.get("designContent")
+            if content:
+                layer_lines.append(f"{key}: {content}")
+        body = "\n".join(layer_lines)
+        if not body:
+            return semantic_mapping.semantic_visual_instruction
+        return (
+            f"{semantic_mapping.semantic_visual_instruction}\n\n"
+            "五层视觉设计：\n"
+            f"{body}"
         )
 
     def _plan_regions(self, instruction: str) -> list[dict]:

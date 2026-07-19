@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import String, DateTime, JSON
+from sqlalchemy import Boolean, String, DateTime, JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -123,6 +123,31 @@ class ReferenceImageLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class CharacterAsset(Base):
+    """Reusable picture-book character identity created during onboarding."""
+
+    __tablename__ = "character_assets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    asset_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    user_id: Mapped[str] = mapped_column(String(64), index=True)
+    relationship_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    role: Mapped[str] = mapped_column(String(32), index=True)
+    source_image_url: Mapped[str] = mapped_column(String(512))
+    style_reference_url: Mapped[str] = mapped_column(String(512), default="")
+    master_image_url: Mapped[str] = mapped_column(String(512), default="")
+    portrait_image_url: Mapped[str] = mapped_column(String(512), default="")
+    half_body_image_url: Mapped[str] = mapped_column(String(512), default="")
+    full_body_image_url: Mapped[str] = mapped_column(String(512), default="")
+    style_version: Mapped[str] = mapped_column(String(64), default="picturebook-character-v1")
+    status: Mapped[str] = mapped_column(String(32), default="processing")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    prompt: Mapped[str] = mapped_column(String(4096), default="")
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class InteractionLog(Base):
     __tablename__ = "interaction_logs"
 
@@ -134,3 +159,22 @@ class InteractionLog(Base):
     target_id: Mapped[str] = mapped_column(String(128), default="")
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MemoryObjectAsset(Base):
+    __tablename__ = "memory_object_assets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    asset_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    relationship_id: Mapped[str] = mapped_column(String(64), index=True)
+    object_name: Mapped[str] = mapped_column(String(128), index=True)
+    mention_count: Mapped[int] = mapped_column(default=0)
+    threshold: Mapped[int] = mapped_column(default=3)
+    image_url: Mapped[str] = mapped_column(String(512), default="")
+    prompt: Mapped[str] = mapped_column(String(2048), default="")
+    status: Mapped[str] = mapped_column(String(32), default="ready")
+    examples: Mapped[list] = mapped_column(JSON, default=list)
+    source_message_ids: Mapped[list] = mapped_column(JSON, default=list)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

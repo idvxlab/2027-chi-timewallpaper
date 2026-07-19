@@ -11,10 +11,18 @@ from fastapi import HTTPException
 
 from app.core.config import settings
 from app.mock.transcripts import MOCK_TRANSCRIPTS
+from app.services.chatbox_asr_service import transcribe_chatbox_audio
+from app.services.openai_image_service import (
+    build_images_generation_payload,
+    collect_image_refs,
+    resolve_image_endpoint,
+    save_image_ref,
+)
 
 
 GENERATED_DIR = Path(settings.storage_local_dir) / "generated"
 REFERENCES_DIR = Path(settings.storage_local_dir) / "references"
+AUDIO_INPUTS_DIR = Path(settings.storage_local_dir) / "audio-inputs"
 
 
 def _response_text(payload) -> str:
@@ -178,6 +186,10 @@ async def _save_image_ref(ref: str, client: httpx.AsyncClient) -> str:
 
 
 async def transcribe_audio(audio: bytes, filename: str, content_type: str, run_id: str | None = None) -> dict:
+    return await transcribe_chatbox_audio(audio, filename=filename, content_type=content_type, run_id=run_id)
+
+
+async def _legacy_transcribe_audio(audio: bytes, filename: str, content_type: str, run_id: str | None = None) -> dict:
     api_key = settings.effective_audio_api_key
     api_base_url = settings.effective_audio_api_base_url.rstrip("/")
     endpoint = settings.audio_transcription_endpoint.strip()
@@ -185,6 +197,17 @@ async def transcribe_audio(audio: bytes, filename: str, content_type: str, run_i
     if not api_key or not api_base_url:
         idx = len(audio) % len(MOCK_TRANSCRIPTS)
         return {"transcript": MOCK_TRANSCRIPTS[idx], "raw": {"provider": "mock", "size": len(audio)}}
+
+    if _use_doubao_chat_asr(endpoint, settings.audio_transcription_model):
+        return await _transcribe_audio_with_doubao_chat(
+            audio=audio,
+            filename=filename,
+            content_type=content_type,
+            api_key=api_key,
+            api_base_url=api_base_url,
+            endpoint=endpoint,
+            run_id=run_id,
+        )
 
     if not endpoint:
         endpoint = f"{api_base_url}/v1/audio/transcriptions"
@@ -227,6 +250,130 @@ async def transcribe_audio(audio: bytes, filename: str, content_type: str, run_i
     return {"transcript": transcript, "raw": data}
 
 
+def _use_doubao_chat_asr(endpoint: str, model: str) -> bool:
+    text = f"{endpoint} {model}".lower()
+    return "doubao" in text and ("chat/completions" in text or "seed" in text)
+
+
+async def _transcribe_audio_with_doubao_chat(
+    *,
+    audio: bytes,
+    filename: str,
+    content_type: str,
+    api_key: str,
+    api_base_url: str,
+    endpoint: str,
+    run_id: str | None,
+) -> dict:
+    endpoint = endpoint or f"{api_base_url}/api/v3/chat/completions"
+    audio_url, audio_format = _save_audio_input_for_url(audio, filename, content_type)
+    if _is_local_public_base_url():
+        _log(
+            run_id,
+            "ASR Doubao audio URL is local; Ark must be able to fetch it. "
+            "Set PUBLIC_API_BASE_URL to a public tunnel/domain if upstream returns audio fetch errors.",
+        )
+    payload = {
+        "model": settings.audio_transcription_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "url": audio_url,
+                            "format": audio_format,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": "请识别音频中的中文内容，只返回转写文本，不要解释。",
+                    },
+                ],
+            }
+        ],
+    }
+    try:
+        _log(run_id, f"ASR Doubao chat request model={settings.audio_transcription_model} endpoint={endpoint} audioUrl={audio_url}")
+        async with httpx.AsyncClient(timeout=75) as client:
+            response = await client.post(
+                endpoint,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            response.raise_for_status()
+            _log(run_id, f"ASR Doubao chat response status={response.status_code}")
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Doubao ASR HTTP {exc.response.status_code}: {exc.response.text[:800]}",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Doubao ASR request failed ({type(exc).__name__}): {repr(exc)}",
+        ) from exc
+
+    try:
+        data = response.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail=f"Doubao ASR returned non-JSON response: {response.text[:300]}") from exc
+
+    transcript = _response_text(data)
+    if not transcript:
+        raise HTTPException(status_code=502, detail=f"Doubao ASR response did not contain text: {json.dumps(data, ensure_ascii=False)[:800]}")
+    return {
+        "transcript": transcript,
+        "raw": {
+            "provider": "doubao_chat_audio",
+            "audioUrl": audio_url,
+            "response": data,
+        },
+    }
+
+
+def _save_audio_input_for_url(audio: bytes, filename: str, content_type: str) -> tuple[str, str]:
+    AUDIO_INPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    ext = _audio_extension(content_type, filename)
+    saved_name = f"asr-{uuid.uuid4().hex}.{ext}"
+    path = AUDIO_INPUTS_DIR / saved_name
+    path.write_bytes(audio)
+    public_base = settings.public_api_base_url.rstrip("/")
+    return f"{public_base}/audio-inputs/{saved_name}", ext
+
+
+def _audio_extension(content_type: str, filename: str) -> str:
+    suffix = Path(filename or "").suffix.lower().strip(".")
+    if suffix in {"mp3", "wav", "m4a", "aac", "ogg", "flac", "webm"}:
+        return suffix
+    content_type = (content_type or "").lower()
+    if "mpeg" in content_type or "mp3" in content_type:
+        return "mp3"
+    if "wav" in content_type:
+        return "wav"
+    if "webm" in content_type:
+        return "webm"
+    if "ogg" in content_type:
+        return "ogg"
+    if "flac" in content_type:
+        return "flac"
+    if "aac" in content_type:
+        return "aac"
+    if "mp4" in content_type or "m4a" in content_type:
+        return "m4a"
+    return "wav"
+
+
+def _is_local_public_base_url() -> bool:
+    base = settings.public_api_base_url.lower()
+    return "127.0.0.1" in base or "localhost" in base
+
+
 async def generate_wallpaper(transcript: str) -> dict:
     return await generate_wallpaper_from_prompt(_build_wallpaper_prompt(transcript))
 
@@ -235,6 +382,8 @@ async def generate_wallpaper_from_prompt(
     prompt: str,
     run_id: str | None = None,
     reference_image_urls: list[str] | None = None,
+    aspect_ratio: str | None = None,
+    image_size: str | None = None,
 ) -> dict:
     api_key = settings.effective_image_api_key
     api_base_url = settings.effective_image_api_base_url.rstrip("/")
@@ -244,24 +393,20 @@ async def generate_wallpaper_from_prompt(
         return {"imageUrl": "", "raw": {"provider": "mock", "prompt": prompt}}
 
     resolved_refs = [_image_ref_for_upstream(url) for url in (reference_image_urls or []) if url]
-    is_gemini_generate_content = (
-        settings.image_chat_model == "gemini-2.5-flash-image"
-        or "generateContent" in endpoint
-    )
+    is_gemini_generate_content = "generateContent" in endpoint or settings.image_chat_model.startswith("gemini")
     if is_gemini_generate_content:
-        if not endpoint:
-            endpoint = f"{api_base_url}/v1beta/models/{settings.image_chat_model}:generateContent"
-        payload = _build_gemini_image_payload(prompt, resolved_refs)
+        endpoint = resolve_image_endpoint(api_base_url, endpoint, f"/v1beta/models/{settings.image_chat_model}:generateContent")
+        payload = _build_gemini_image_payload(prompt, resolved_refs, aspect_ratio=aspect_ratio, image_size=image_size)
     else:
-        if not endpoint:
-            endpoint = f"{api_base_url}/v1/images/generations"
-        payload = {
-            "model": settings.image_chat_model,
-            "prompt": prompt,
-            "aspect_ratio": settings.image_aspect_ratio,
-        }
-        if resolved_refs:
-            payload["image"] = resolved_refs
+        endpoint = resolve_image_endpoint(api_base_url, endpoint, "/v1/images/generations")
+        payload = build_images_generation_payload(
+            prompt,
+            resolved_refs,
+            api_base_url,
+            endpoint,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+        )
 
     timeout_seconds = settings.image_request_timeout_seconds
     attempts = max(1, settings.image_request_retries + 1)
@@ -285,11 +430,11 @@ async def generate_wallpaper_from_prompt(
                 response.raise_for_status()
                 _log(run_id, f"Image upstream response status={response.status_code}")
                 data = response.json()
-                refs = _collect_image_refs(data)
+                refs = collect_image_refs(data)
                 _log(run_id, f"Image refs collected count={len(refs)}")
                 if not refs:
                     raise HTTPException(status_code=502, detail=f"Image API response did not contain image data: {json.dumps(data, ensure_ascii=False)[:600]}")
-                image_url = await _save_image_ref(refs[0], client)
+                image_url = await save_image_ref(refs[0], client)
                 _log(run_id, f"Image saved url={image_url}")
                 return {"imageUrl": image_url, "raw": data}
         except httpx.ReadTimeout as exc:
@@ -315,7 +460,12 @@ async def generate_wallpaper_from_prompt(
             raise HTTPException(status_code=502, detail=f"Image API parse failed: {exc}") from exc
 
 
-def _build_gemini_image_payload(prompt: str, resolved_refs: list[str]) -> dict:
+def _build_gemini_image_payload(
+    prompt: str,
+    resolved_refs: list[str],
+    aspect_ratio: str | None = None,
+    image_size: str | None = None,
+) -> dict:
     parts: list[dict] = []
     for ref in resolved_refs:
         part = _inline_image_part(ref)
@@ -331,8 +481,8 @@ def _build_gemini_image_payload(prompt: str, resolved_refs: list[str]) -> dict:
         ],
         "generationConfig": {
             "imageConfig": {
-                "aspectRatio": settings.image_aspect_ratio,
-                "imageSize": settings.image_size,
+                "aspectRatio": aspect_ratio or settings.image_aspect_ratio,
+                "imageSize": image_size or settings.image_size,
             },
             "responseModalities": ["IMAGE"],
         },

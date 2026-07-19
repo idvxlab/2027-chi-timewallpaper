@@ -14,7 +14,9 @@ from app.agents.memory_relation_agent import MemoryRelationAgent
 from app.agents.semantic_mapping_agent import SemanticMappingAgent
 from app.db.models import AgentRunLog, AsrLog, MessageLog, RelationshipState, WallpaperLog
 from app.db.session import Base, SessionLocal, engine
-from app.schemas.agent import AgentRunResult, AgentStep
+from app.schemas.agent import AgentRunResult, AgentStep, BaseSceneOut, ComfortReplyOut, MemoryObjectsOut
+from app.services.comfort_reply_service import ComfortReplyService
+from app.services.memory_object_service import MemoryObjectService
 from app.services.user_context import normalize_user_context
 
 
@@ -24,6 +26,27 @@ class MultiAgentOrchestrator:
         self.memory_relation_agent = MemoryRelationAgent()
         self.semantic_mapping_agent = SemanticMappingAgent()
         self.image_generation_agent = ImageGenerationAgent()
+        self.comfort_reply_service = ComfortReplyService()
+        self.memory_object_service = MemoryObjectService()
+
+    async def run_base_scene(self) -> BaseSceneOut:
+        run_id = uuid.uuid4().hex
+        self._log(run_id, "run started input=base_scene")
+        t0 = perf_counter()
+        self._log(run_id, "step image_generation started")
+        image = await self.image_generation_agent.run_base_scene(run_id=run_id)
+        status = "completed" if image.wallpaper_url else "failed"
+        self._log(
+            run_id,
+            f"step image_generation done elapsed={perf_counter() - t0:.2f}s imageUrl={image.wallpaper_url or '(empty)'}",
+        )
+        self._log(run_id, f"run done status={status}")
+        return BaseSceneOut(
+            status=status,
+            image_url=image.wallpaper_url,
+            generation_mode=image.generation_mode,
+            raw=image.asset_metadata,
+        )
 
     async def run_audio(
         self,
@@ -208,6 +231,103 @@ class MultiAgentOrchestrator:
         self._log(run_id, f"run done total_elapsed={(result.updated_at - result.created_at).total_seconds():.2f}s")
         return result
 
+    async def run_comfort_reply(
+        self,
+        transcript: str,
+        user_id: Optional[str] = None,
+        relationship_id: Optional[str] = None,
+        persist: bool = False,
+    ) -> ComfortReplyOut:
+        user_id, relationship_id = normalize_user_context(user_id, relationship_id)
+        run_id = uuid.uuid4().hex
+        self._log(run_id, f"comfort reply started chars={len(transcript)} user={user_id} relationship={relationship_id} persist={persist}")
+
+        t0 = perf_counter()
+        language = await self.language_emotion_agent.run_text(
+            transcript,
+            asr_raw={"provider": "comfort_reply_debug", "source": "manual_transcript"},
+            run_id=run_id,
+            user_id=user_id,
+            relationship_id=relationship_id,
+        )
+        self._log(run_id, f"comfort language_emotion done elapsed={perf_counter() - t0:.2f}s transcript={language.transcript[:48]}")
+        self._log_script_analyzer_internal(run_id, language.raw if isinstance(language.raw, dict) else {})
+        self._log_initial_short_term_table(run_id, language.raw.get("initial_short_term_table") if isinstance(language.raw, dict) else None)
+        self._log_script_reflection(run_id, language.raw.get("reflection") if isinstance(language.raw, dict) else None)
+        self._log_short_term_table(run_id, language.short_term_table)
+
+        message_id = ""
+        if persist:
+            await self._save_asr_log(language.transcript, language.raw)
+            message_id = await self._save_message_log(run_id, user_id, relationship_id, "comfort_text", language)
+
+        t0 = perf_counter()
+        memory = await self.memory_relation_agent.run(language, relationship_id=relationship_id, run_id=run_id)
+        self._log(run_id, f"comfort memory_relation done elapsed={perf_counter() - t0:.2f}s trend={memory.relational.get('relationship_trend')}")
+        self._log_long_term_table(run_id, memory.long_term_table)
+        if persist:
+            await self._save_relationship_state(relationship_id, memory)
+
+        comfort = self.comfort_reply_service.build(language, memory, user_id)
+        self._log_comfort_reply(run_id, comfort)
+
+        result = ComfortReplyOut(
+            run_id=run_id,
+            status="done",
+            user_id=user_id,
+            relationship_id=relationship_id,
+            comfort_reply=comfort,
+        )
+        if persist:
+            await self._save_comfort_reply_run(result, message_id)
+        self._log(run_id, "comfort reply done")
+        return result
+
+    async def run_memory_objects(
+        self,
+        user_id: Optional[str] = None,
+        relationship_id: Optional[str] = None,
+        limit: int = 8,
+        threshold: int = 3,
+        generate_missing: bool = True,
+    ) -> MemoryObjectsOut:
+        user_id, relationship_id = normalize_user_context(user_id, relationship_id)
+        run_id = uuid.uuid4().hex
+        self._log(
+            run_id,
+            (
+                "memory objects started "
+                f"user={user_id} relationship={relationship_id} "
+                f"limit={limit} threshold={threshold} generate_missing={generate_missing}"
+            ),
+        )
+        self._ensure_db()
+        items = await self.memory_object_service.list_assets(
+            relationship_id=relationship_id,
+            threshold=threshold,
+            limit=limit,
+            generate_missing=generate_missing,
+            run_id=run_id,
+        )
+        ready_count = sum(1 for item in items if item.ready)
+        triggered = [item.name for item in items if item.mention_count >= threshold]
+        self._log(
+            run_id,
+            f"memory objects done collected={len(items)} triggered={len(triggered)} ready={ready_count} items={','.join(triggered[:8])}",
+        )
+
+        result = MemoryObjectsOut(
+            run_id=run_id,
+            status="done",
+            user_id=user_id,
+            relationship_id=relationship_id,
+            threshold=threshold,
+            items=items,
+            raw={"itemsCount": len(items), "readyCount": ready_count, "triggered": triggered},
+        )
+        await self._save_memory_objects_run(result)
+        return result
+
     async def get_run(self, run_id: str) -> AgentRunResult:
         with SessionLocal() as session:
             row = session.query(AgentRunLog).filter(AgentRunLog.run_id == run_id).one_or_none()
@@ -220,6 +340,38 @@ class MultiAgentOrchestrator:
         self._ensure_db()
         with SessionLocal() as session:
             session.add(AsrLog(transcript=transcript[:1024], raw=raw))
+            session.commit()
+
+    async def _save_comfort_reply_run(self, result: ComfortReplyOut, message_id: str) -> None:
+        self._ensure_db()
+        now = datetime.utcnow()
+        payload = result.model_dump(mode="json", by_alias=True)
+        payload["messageId"] = message_id
+        with SessionLocal() as session:
+            session.add(
+                AgentRunLog(
+                    run_id=result.run_id,
+                    status=result.status,
+                    payload=payload,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.commit()
+
+    async def _save_memory_objects_run(self, result: MemoryObjectsOut) -> None:
+        self._ensure_db()
+        now = datetime.utcnow()
+        with SessionLocal() as session:
+            session.add(
+                AgentRunLog(
+                    run_id=result.run_id,
+                    status=result.status,
+                    payload=result.model_dump(mode="json", by_alias=True),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
             session.commit()
 
     async def _save_message_log(self, run_id: str, user_id: str, relationship_id: str, input_type: str, language) -> str:
@@ -510,6 +662,18 @@ class MultiAgentOrchestrator:
                 "===== Designer 五层画面设计 END =====",
             ]
         )
+        self._log(run_id, "\n".join(lines))
+
+    def _log_comfort_reply(self, run_id: str, comfort) -> None:
+        lines = [
+            "",
+            "===== Comfort Reply 建议回复 START =====",
+            f"text: {comfort.text}",
+            f"tone: {comfort.tone}",
+            f"strategy: {comfort.strategy}",
+            f"source: {self._truncate(self._format_value(comfort.source), 360)}",
+            "===== Comfort Reply 建议回复 END =====",
+        ]
         self._log(run_id, "\n".join(lines))
 
     def _format_table_section(self, section: dict) -> list[str]:

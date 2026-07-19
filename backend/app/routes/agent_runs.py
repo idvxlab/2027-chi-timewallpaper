@@ -8,9 +8,19 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 
 from app.agents import MultiAgentOrchestrator
 from app.core.config import settings
-from app.db.models import ReferenceImageLog
+from app.db.models import CharacterAsset, ReferenceImageLog
 from app.db.session import SessionLocal
-from app.schemas.agent import AgentRunCreateOut, AgentRunResult, AgentRunTextIn
+from app.schemas.agent import (
+    AgentRunCreateOut,
+    AgentRunResult,
+    AgentRunTextIn,
+    BaseSceneIn,
+    BaseSceneOut,
+    ComfortReplyIn,
+    ComfortReplyOut,
+    MemoryObjectsIn,
+    MemoryObjectsOut,
+)
 from app.services.user_context import normalize_user_context
 
 router = APIRouter()
@@ -46,10 +56,29 @@ def _find_default_reference(role: str) -> Optional[str]:
 def _resolve_role_references(
     elder_reference_url: Optional[str] = None,
     child_reference_url: Optional[str] = None,
+    relationship_id: Optional[str] = None,
 ) -> dict[str, str | None]:
+    generated_assets: dict[str, Optional[str]] = {"elder": None, "child": None}
+    if relationship_id:
+        with SessionLocal() as session:
+            rows = (
+                session.query(CharacterAsset)
+                .filter(
+                    CharacterAsset.relationship_id == relationship_id,
+                    CharacterAsset.status == "ready",
+                    CharacterAsset.is_active.is_(True),
+                )
+                .order_by(CharacterAsset.updated_at.desc())
+                .all()
+            )
+            for row in rows:
+                if row.role in generated_assets and not generated_assets[row.role]:
+                    generated_assets[row.role] = row.master_image_url
     return {
-        "elder": elder_reference_url or _find_default_reference("elder"),
-        "child": child_reference_url or _find_default_reference("child"),
+        # Once onboarding has produced a stable cartoon identity, the normal
+        # agent flow must not bypass it with a one-off raw portrait URL.
+        "elder": generated_assets["elder"] or elder_reference_url or _find_default_reference("elder"),
+        "child": generated_assets["child"] or child_reference_url or _find_default_reference("child"),
     }
 
 
@@ -118,7 +147,11 @@ async def create_audio_agent_run(
         user_id=user_id,
         relationship_id=relationship_id,
         previous_image_url=previous_image_url,
-        role_reference_images=_resolve_role_references(elder_reference_url, child_reference_url),
+        role_reference_images=_resolve_role_references(
+            elder_reference_url,
+            child_reference_url,
+            relationship_id=relationship_id,
+        ),
     )
     return AgentRunCreateOut(run_id=result.run_id, status=result.status, result=result)
 
@@ -130,9 +163,39 @@ async def create_text_agent_run(body: AgentRunTextIn) -> AgentRunCreateOut:
         user_id=body.user_id,
         relationship_id=body.relationship_id,
         previous_image_url=body.previous_image_url,
-        role_reference_images=_resolve_role_references(body.elder_reference_url, body.child_reference_url),
+        role_reference_images=_resolve_role_references(
+            body.elder_reference_url,
+            body.child_reference_url,
+            relationship_id=body.relationship_id,
+        ),
     )
     return AgentRunCreateOut(run_id=result.run_id, status=result.status, result=result)
+
+
+@router.post("/base-scene", response_model=BaseSceneOut)
+async def create_base_scene(_: Optional[BaseSceneIn] = None) -> BaseSceneOut:
+    return await orchestrator.run_base_scene()
+
+
+@router.post("/comfort-reply", response_model=ComfortReplyOut)
+async def create_comfort_reply(body: ComfortReplyIn) -> ComfortReplyOut:
+    return await orchestrator.run_comfort_reply(
+        body.transcript,
+        user_id=body.user_id,
+        relationship_id=body.relationship_id,
+        persist=body.persist,
+    )
+
+
+@router.post("/memory-objects", response_model=MemoryObjectsOut)
+async def create_memory_objects(body: MemoryObjectsIn) -> MemoryObjectsOut:
+    return await orchestrator.run_memory_objects(
+        user_id=body.user_id,
+        relationship_id=body.relationship_id,
+        limit=body.limit,
+        threshold=body.threshold,
+        generate_missing=body.generate_missing,
+    )
 
 
 @router.get("/{run_id}", response_model=AgentRunResult)
