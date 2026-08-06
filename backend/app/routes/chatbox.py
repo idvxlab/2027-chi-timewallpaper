@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Optional
 
-from fastapi import APIRouter, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, File, UploadFile, WebSocket, WebSocketDisconnect
 
-from app.services.audio_understanding_tool import analyze_audio_affect
 from app.services.chatbox_asr_service import transcribe_chatbox_audio
 
 
@@ -24,26 +22,6 @@ async def asr_file(audio: UploadFile = File(...)) -> dict:
     )
     return {
         "transcript": result.get("transcript", ""),
-        "raw": result.get("raw", {}),
-    }
-
-
-@router.post("/chatbox/audio-understanding")
-async def audio_understanding(
-    audio: UploadFile = File(...),
-    transcript: Optional[str] = Form(default=""),
-) -> dict:
-    raw = await audio.read()
-    result = await analyze_audio_affect(
-        raw,
-        filename=audio.filename or "recording.wav",
-        content_type=audio.content_type or "audio/wav",
-        transcript=transcript or "",
-        run_id=f"audio-affect-{uuid.uuid4().hex}",
-    )
-    return {
-        "voiceAffect": result.get("voiceAffect", {}),
-        "semanticTone": result.get("semanticTone", ""),
         "raw": result.get("raw", {}),
     }
 

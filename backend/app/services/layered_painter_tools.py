@@ -8,19 +8,18 @@ import httpx
 from fastapi import HTTPException
 
 from app.core.config import settings
-from app.services.layered_tools.edit_elder_region_wallpaper_service import (
-    edit_elder_region_with_transcript,
-)
 from app.services.layered_tools.generate_dual_character_wallpaper import (
     generate_dual_character_wallpaper,
 )
-from app.services.layered_tools.insert_characters_into_wallpaper_service import (
-    insert_characters_into_wallpaper,
+from app.services.seedream_wallpaper_service import (
+    generate_initial_shared_wallpaper,
+    reflow_shared_relationship_view as render_reflow_shared_relationship_view,
+    update_shared_wallpaper,
 )
 
 
 class LayeredPainterTools:
-    """Thin tool wrapper around the copied staged wallpaper generation services."""
+    """Thin wrapper around staged shared-wallpaper rendering services."""
 
     async def generate_base_scene(
         self,
@@ -33,43 +32,62 @@ class LayeredPainterTools:
             partner_image_bytes=partner_image_bytes,
         )
 
-    async def first_voice_compose(
+    async def initialize_wallpaper_view(
         self,
         *,
         base_image_url: str,
         younger_image_bytes: bytes,
         elder_image_bytes: bytes,
-        transcript: str,
-        current_role: str = "parent",
+        designer_five_layer_plan: dict,
+        semantic_visual_instruction: str,
+        speaker_role: str,
     ) -> dict:
-        return await insert_characters_into_wallpaper(
+        """Initialize both people in the relationship's shared fixed-layout view."""
+        return await generate_initial_shared_wallpaper(
             base_image_url=base_image_url,
-            younger_image_bytes=younger_image_bytes,
-            elder_image_bytes=elder_image_bytes,
-            transcript=transcript,
-            current_role=current_role,
+            child_identity_bytes=younger_image_bytes,
+            elder_identity_bytes=elder_image_bytes,
+            five_layer_plan=designer_five_layer_plan,
+            semantic_visual_instruction=semantic_visual_instruction,
+            speaker_role=speaker_role,
         )
 
     async def update_current_side(
         self,
         *,
         base_image_url: str,
-        transcript: str,
-        current_side: str = "left_bottom",
+        speaker_image_bytes: bytes = b"",
+        designer_five_layer_plan: dict,
+        semantic_visual_instruction: str,
+        speaker_role: str,
     ) -> dict:
-        # The copied prototype currently implements the lower-left regional edit.
-        # Keep the original tool unchanged and expose the role-neutral wrapper name here.
-        if current_side not in {"left_bottom", "elder_lower_left", "current_side"}:
-            return {
-                "imageUrl": "",
-                "raw": {
-                    "error": f"layered current-side edit only supports left_bottom for now, got {current_side!r}",
-                    "currentSide": current_side,
-                },
-            }
-        return await edit_elder_region_with_transcript(
+        """Update the speaker's fixed region in the shared wallpaper."""
+        return await update_shared_wallpaper(
             base_image_url=base_image_url,
-            transcript=transcript,
+            speaker_identity_bytes=speaker_image_bytes,
+            five_layer_plan=designer_five_layer_plan,
+            semantic_visual_instruction=semantic_visual_instruction,
+            speaker_role=speaker_role,
+        )
+
+    async def reflow_shared_relationship_view(
+        self,
+        *,
+        base_image_url: str,
+        younger_image_bytes: bytes,
+        elder_image_bytes: bytes,
+        designer_five_layer_plan: dict,
+        semantic_visual_instruction: str,
+        speaker_role: str,
+    ) -> dict:
+        """Move both identities into one deterministic shared-space layout."""
+        return await render_reflow_shared_relationship_view(
+            base_image_url=base_image_url,
+            child_identity_bytes=younger_image_bytes,
+            elder_identity_bytes=elder_image_bytes,
+            five_layer_plan=designer_five_layer_plan,
+            semantic_visual_instruction=semantic_visual_instruction,
+            speaker_role=speaker_role,
         )
 
     async def resolve_reference_bytes(self, image_url: str | None) -> bytes:

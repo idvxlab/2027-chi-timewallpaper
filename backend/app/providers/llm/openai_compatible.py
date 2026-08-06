@@ -34,6 +34,8 @@ class OpenAICompatibleLLM(LLMProvider):
         system = kwargs.get("system", "你是一个严格按照指令输出的中文 AI 助手。")
         temperature = kwargs.get("temperature", settings.llm_temperature)
         response_format = kwargs.get("response_format")
+        enable_thinking = kwargs.get("enable_thinking")
+        max_tokens = kwargs.get("max_tokens")
         payload: dict[str, Any] = {
             "model": kwargs.get("model") or self.model,
             "temperature": temperature,
@@ -44,6 +46,10 @@ class OpenAICompatibleLLM(LLMProvider):
         }
         if response_format:
             payload["response_format"] = response_format
+        if enable_thinking is not None:
+            payload["enable_thinking"] = bool(enable_thinking)
+        if max_tokens is not None:
+            payload["max_tokens"] = int(max_tokens)
 
         async with httpx.AsyncClient(timeout=kwargs.get("timeout", 90)) as client:
             response = await client.post(

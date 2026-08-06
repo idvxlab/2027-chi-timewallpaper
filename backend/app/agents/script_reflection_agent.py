@@ -116,7 +116,7 @@ Script Analyzer 初始短期表：
       "object": {{"value": ["物件或活动线索"], "evidence": "原文证据或合理推断说明", "confidence": 0.0}}
     }},
     "B_affective_semantics": {{
-      "momentary_affect": {{"value": "愉悦|平静|悲伤|焦虑|思念|期待|疲惫", "evidence": "原文证据", "confidence": 0.0}},
+      "momentary_affect": {{"value": "愉悦|平静|悲伤|焦虑|思念|期待|疲惫|生气|惊讶", "evidence": "原文证据", "confidence": 0.0}},
       "affective_intensity": {{"value": "轻微|明显|强烈|波动", "evidence": "原文证据", "confidence": 0.0}},
       "affective_ambiguity": {{"value": "明确|含混|难以判断|需要上下文", "evidence": "原文证据", "confidence": 0.0}}
     }},

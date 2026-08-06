@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime
@@ -7,7 +8,9 @@ from time import perf_counter
 from typing import Optional
 
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 
+from app.agents.chatbot_agent import ChatBotAgent, ChatBotAudioContext
 from app.agents.image_generation_agent import ImageGenerationAgent
 from app.agents.language_emotion_agent import LanguageEmotionAgent
 from app.agents.memory_relation_agent import MemoryRelationAgent
@@ -22,6 +25,7 @@ from app.services.user_context import normalize_user_context
 
 class MultiAgentOrchestrator:
     def __init__(self) -> None:
+        self.chatbot_agent = ChatBotAgent()
         self.language_emotion_agent = LanguageEmotionAgent()
         self.memory_relation_agent = MemoryRelationAgent()
         self.semantic_mapping_agent = SemanticMappingAgent()
@@ -57,31 +61,86 @@ class MultiAgentOrchestrator:
         role_reference_images: Optional[dict[str, str | None]] = None,
         user_id: Optional[str] = None,
         relationship_id: Optional[str] = None,
+        generation_stage: Optional[str] = None,
+        speaker_role: Optional[str] = None,
+        analyze_only: bool = False,
+        prepared_audio_context: Optional[ChatBotAudioContext] = None,
+        run_id: Optional[str] = None,
+        event_seq: Optional[int] = None,
     ) -> AgentRunResult:
         user_id, relationship_id = normalize_user_context(user_id, relationship_id)
-        run_id = uuid.uuid4().hex
+        run_id = run_id or uuid.uuid4().hex
         created_at = datetime.utcnow()
         self._log(run_id, f"run started input=audio filename={filename} bytes={len(audio)} user={user_id} relationship={relationship_id}")
         steps = [
-            AgentStep(name="language_emotion", status="running"),
+            AgentStep(name="chat_bot", status="running"),
+            AgentStep(name="language_emotion"),
             AgentStep(name="memory_relation"),
             AgentStep(name="semantic_mapping"),
             AgentStep(name="image_generation"),
         ]
+        steps[2].status = "running"
+        memory_task = asyncio.create_task(
+            self.memory_relation_agent.run_history(
+                relationship_id=relationship_id,
+                run_id=run_id,
+            )
+        )
+        self._log(run_id, "step memory_relation started in parallel from database history")
 
         t0 = perf_counter()
-        self._log(run_id, "step language_emotion started")
-        language = await self.language_emotion_agent.run(
-            audio,
-            content_type,
-            filename,
-            run_id=run_id,
-            user_id=user_id,
-            relationship_id=relationship_id,
+        self._log(run_id, "step chatbot audio preparation started")
+        audio_context = prepared_audio_context
+        if audio_context is None:
+            audio_context = await self.chatbot_agent.prepare_audio(
+                audio,
+                content_type=content_type,
+                filename=filename,
+                run_id=run_id,
+            )
+        else:
+            self._log(run_id, "using ChatBot streaming audio context")
+        self._log(
+            run_id,
+            f"step chatbot audio preparation done elapsed={perf_counter() - t0:.2f}s transcript={audio_context.transcript[:48]}",
         )
-        steps[0].status = "done"
+
         steps[1].status = "running"
-        self._log(run_id, f"step language_emotion done elapsed={perf_counter() - t0:.2f}s transcript={language.transcript[:48]}")
+        self._log(run_id, "steps chatbot reply and language_emotion started in parallel")
+        parallel_t0 = perf_counter()
+        chat_task = asyncio.create_task(
+            self.chatbot_agent.generate_reply(
+                audio_context.transcript,
+                voice_affect=audio_context.voice_affect,
+                user_id=user_id,
+                relationship_id=relationship_id,
+                run_id=run_id,
+                audio_context=audio_context,
+            )
+        )
+        language_task = asyncio.create_task(
+            self.language_emotion_agent.run_text(
+                audio_context.transcript,
+                asr_raw={
+                    "asr": audio_context.asr_raw,
+                    "audio_understanding": audio_context.audio_affect_raw,
+                },
+                voice_affect=audio_context.voice_affect,
+                run_id=run_id,
+                user_id=user_id,
+                relationship_id=relationship_id,
+            )
+        )
+        chat_bot, language, memory = await asyncio.gather(chat_task, language_task, memory_task)
+        language = language.model_copy(update={"reply": chat_bot.reply})
+        memory = self.memory_relation_agent.attach_current_short(memory, language, user_id=user_id)
+        steps[0].status = "done"
+        steps[1].status = "done"
+        steps[2].status = "done"
+        self._log(
+            run_id,
+            f"steps chatbot reply, language_emotion and memory_relation joined elapsed={perf_counter() - parallel_t0:.2f}s",
+        )
         self._log_script_analyzer_internal(run_id, language.raw if isinstance(language.raw, dict) else {})
         self._log_initial_short_term_table(run_id, language.raw.get("initial_short_term_table") if isinstance(language.raw, dict) else None)
         self._log_script_reflection(run_id, language.raw.get("reflection") if isinstance(language.raw, dict) else None)
@@ -89,25 +148,58 @@ class MultiAgentOrchestrator:
         await self._save_asr_log(language.transcript, language.raw)
         message_id = await self._save_message_log(run_id, user_id, relationship_id, "audio", language)
 
-        t0 = perf_counter()
-        self._log(run_id, "step memory_relation started")
-        memory = await self.memory_relation_agent.run(language, relationship_id=relationship_id, run_id=run_id)
-        steps[1].status = "done"
-        steps[2].status = "running"
-        self._log(run_id, f"step memory_relation done elapsed={perf_counter() - t0:.2f}s trend={memory.relational.get('relationship_trend')}")
+        steps[3].status = "running"
+        self._log(run_id, f"step memory_relation done trend={memory.relational.get('relationship_trend')}")
         self._log_long_term_table(run_id, memory.long_term_table)
-        await self._save_relationship_state(relationship_id, memory)
+        state_saved = await self._save_relationship_state(
+            relationship_id,
+            memory,
+            event_seq=event_seq,
+        )
+        if not state_saved:
+            self._log(
+                run_id,
+                f"relationship state skipped stale event_seq={event_seq}",
+            )
 
         t0 = perf_counter()
         self._log(run_id, "step semantic_mapping started")
-        semantic = await self.semantic_mapping_agent.run(language, memory, run_id=run_id)
-        steps[2].status = "done"
-        steps[3].status = "running"
+        semantic = await self.semantic_mapping_agent.run(
+            language,
+            memory,
+            run_id=run_id,
+            relationship_id=relationship_id,
+            user_id=user_id,
+        )
+        steps[3].status = "done"
+        steps[4].status = "running"
         self._log(
             run_id,
             f"step semantic_mapping done elapsed={perf_counter() - t0:.2f}s hits={len(semantic.mapping_trace)} composer={semantic.cognitive_scaffold.get('composer')}",
         )
         self._log_designer_output(run_id, semantic)
+
+        if analyze_only:
+            steps[4].status = "pending"
+            result = AgentRunResult(
+                run_id=run_id,
+                status="analyzed",
+                user_id=user_id,
+                relationship_id=relationship_id,
+                steps=steps,
+                chat_bot=chat_bot,
+                language_emotion=language,
+                memory_relation=memory,
+                semantic_mapping=semantic,
+                created_at=created_at,
+                updated_at=datetime.utcnow(),
+            )
+            await self._save_run(result)
+            self._log(
+                run_id,
+                "analysis done; view rendering delegated to versioned render tasks",
+            )
+            return result
 
         t0 = perf_counter()
         self._log(run_id, "step image_generation started")
@@ -116,9 +208,17 @@ class MultiAgentOrchestrator:
             previous_image_url=previous_image_url,
             role_reference_images=role_reference_images,
             run_id=run_id,
+            generation_stage=generation_stage,
+            speaker_role=speaker_role,
         )
-        steps[3].status = "done"
-        await self._save_wallpaper_log(run_id, message_id, relationship_id, semantic, image)
+        await self._save_wallpaper_log(
+            run_id,
+            message_id,
+            relationship_id,
+            semantic,
+            image,
+        )
+        steps[4].status = "done"
         self._log(
             run_id,
             f"step image_generation done elapsed={perf_counter() - t0:.2f}s imageUrl={image.wallpaper_url or '(empty)'} regions={','.join(image.changed_regions)}",
@@ -130,6 +230,7 @@ class MultiAgentOrchestrator:
             user_id=user_id,
             relationship_id=relationship_id,
             steps=steps,
+            chat_bot=chat_bot,
             language_emotion=language,
             memory_relation=memory,
             semantic_mapping=semantic,
@@ -154,24 +255,47 @@ class MultiAgentOrchestrator:
         created_at = datetime.utcnow()
         self._log(run_id, f"run started input=text chars={len(transcript)} user={user_id} relationship={relationship_id}")
         steps = [
+            AgentStep(name="chat_bot", status="running"),
             AgentStep(name="language_emotion", status="running"),
             AgentStep(name="memory_relation"),
             AgentStep(name="semantic_mapping"),
             AgentStep(name="image_generation"),
         ]
+        steps[2].status = "running"
+        memory_task = asyncio.create_task(
+            self.memory_relation_agent.run_history(
+                relationship_id=relationship_id,
+                run_id=run_id,
+            )
+        )
+        self._log(run_id, "step memory_relation started in parallel from database history")
 
         t0 = perf_counter()
-        self._log(run_id, "step language_emotion started")
-        language = await self.language_emotion_agent.run_text(
-            transcript,
-            asr_raw={"provider": "text_debug", "source": "manual_transcript"},
-            run_id=run_id,
-            user_id=user_id,
-            relationship_id=relationship_id,
+        self._log(run_id, "steps chatbot reply and language_emotion started in parallel")
+        chat_task = asyncio.create_task(
+            self.chatbot_agent.generate_reply(
+                transcript,
+                user_id=user_id,
+                relationship_id=relationship_id,
+                run_id=run_id,
+            )
         )
+        language_task = asyncio.create_task(
+            self.language_emotion_agent.run_text(
+                transcript,
+                asr_raw={"provider": "text_debug", "source": "manual_transcript"},
+                run_id=run_id,
+                user_id=user_id,
+                relationship_id=relationship_id,
+            )
+        )
+        chat_bot, language, memory = await asyncio.gather(chat_task, language_task, memory_task)
+        language = language.model_copy(update={"reply": chat_bot.reply})
+        memory = self.memory_relation_agent.attach_current_short(memory, language, user_id=user_id)
         steps[0].status = "done"
-        steps[1].status = "running"
-        self._log(run_id, f"step language_emotion done elapsed={perf_counter() - t0:.2f}s transcript={language.transcript[:48]}")
+        steps[1].status = "done"
+        steps[2].status = "done"
+        self._log(run_id, f"steps chatbot reply, language_emotion and memory_relation joined elapsed={perf_counter() - t0:.2f}s transcript={language.transcript[:48]}")
         self._log_script_analyzer_internal(run_id, language.raw if isinstance(language.raw, dict) else {})
         self._log_initial_short_term_table(run_id, language.raw.get("initial_short_term_table") if isinstance(language.raw, dict) else None)
         self._log_script_reflection(run_id, language.raw.get("reflection") if isinstance(language.raw, dict) else None)
@@ -179,20 +303,22 @@ class MultiAgentOrchestrator:
         await self._save_asr_log(language.transcript, language.raw)
         message_id = await self._save_message_log(run_id, user_id, relationship_id, "text", language)
 
-        t0 = perf_counter()
-        self._log(run_id, "step memory_relation started")
-        memory = await self.memory_relation_agent.run(language, relationship_id=relationship_id, run_id=run_id)
-        steps[1].status = "done"
-        steps[2].status = "running"
-        self._log(run_id, f"step memory_relation done elapsed={perf_counter() - t0:.2f}s trend={memory.relational.get('relationship_trend')}")
+        steps[3].status = "running"
+        self._log(run_id, f"step memory_relation done trend={memory.relational.get('relationship_trend')}")
         self._log_long_term_table(run_id, memory.long_term_table)
         await self._save_relationship_state(relationship_id, memory)
 
         t0 = perf_counter()
         self._log(run_id, "step semantic_mapping started")
-        semantic = await self.semantic_mapping_agent.run(language, memory, run_id=run_id)
-        steps[2].status = "done"
-        steps[3].status = "running"
+        semantic = await self.semantic_mapping_agent.run(
+            language,
+            memory,
+            run_id=run_id,
+            relationship_id=relationship_id,
+            user_id=user_id,
+        )
+        steps[3].status = "done"
+        steps[4].status = "running"
         self._log(
             run_id,
             f"step semantic_mapping done elapsed={perf_counter() - t0:.2f}s hits={len(semantic.mapping_trace)} composer={semantic.cognitive_scaffold.get('composer')}",
@@ -207,7 +333,7 @@ class MultiAgentOrchestrator:
             role_reference_images=role_reference_images,
             run_id=run_id,
         )
-        steps[3].status = "done"
+        steps[4].status = "done"
         await self._save_wallpaper_log(run_id, message_id, relationship_id, semantic, image)
         self._log(
             run_id,
@@ -220,6 +346,7 @@ class MultiAgentOrchestrator:
             user_id=user_id,
             relationship_id=relationship_id,
             steps=steps,
+            chat_bot=chat_bot,
             language_emotion=language,
             memory_relation=memory,
             semantic_mapping=semantic,
@@ -241,16 +368,27 @@ class MultiAgentOrchestrator:
         user_id, relationship_id = normalize_user_context(user_id, relationship_id)
         run_id = uuid.uuid4().hex
         self._log(run_id, f"comfort reply started chars={len(transcript)} user={user_id} relationship={relationship_id} persist={persist}")
+        memory_task = asyncio.create_task(
+            self.memory_relation_agent.run_history(
+                relationship_id=relationship_id,
+                run_id=run_id,
+            )
+        )
+        self._log(run_id, "comfort memory_relation started in parallel from database history")
 
         t0 = perf_counter()
-        language = await self.language_emotion_agent.run_text(
-            transcript,
-            asr_raw={"provider": "comfort_reply_debug", "source": "manual_transcript"},
-            run_id=run_id,
-            user_id=user_id,
-            relationship_id=relationship_id,
+        language_task = asyncio.create_task(
+            self.language_emotion_agent.run_text(
+                transcript,
+                asr_raw={"provider": "comfort_reply_debug", "source": "manual_transcript"},
+                run_id=run_id,
+                user_id=user_id,
+                relationship_id=relationship_id,
+            )
         )
-        self._log(run_id, f"comfort language_emotion done elapsed={perf_counter() - t0:.2f}s transcript={language.transcript[:48]}")
+        language, memory = await asyncio.gather(language_task, memory_task)
+        memory = self.memory_relation_agent.attach_current_short(memory, language, user_id=user_id)
+        self._log(run_id, f"comfort language_emotion and memory_relation joined elapsed={perf_counter() - t0:.2f}s transcript={language.transcript[:48]}")
         self._log_script_analyzer_internal(run_id, language.raw if isinstance(language.raw, dict) else {})
         self._log_initial_short_term_table(run_id, language.raw.get("initial_short_term_table") if isinstance(language.raw, dict) else None)
         self._log_script_reflection(run_id, language.raw.get("reflection") if isinstance(language.raw, dict) else None)
@@ -261,9 +399,7 @@ class MultiAgentOrchestrator:
             await self._save_asr_log(language.transcript, language.raw)
             message_id = await self._save_message_log(run_id, user_id, relationship_id, "comfort_text", language)
 
-        t0 = perf_counter()
-        memory = await self.memory_relation_agent.run(language, relationship_id=relationship_id, run_id=run_id)
-        self._log(run_id, f"comfort memory_relation done elapsed={perf_counter() - t0:.2f}s trend={memory.relational.get('relationship_trend')}")
+        self._log(run_id, f"comfort memory_relation done trend={memory.relational.get('relationship_trend')}")
         self._log_long_term_table(run_id, memory.long_term_table)
         if persist:
             await self._save_relationship_state(relationship_id, memory)
@@ -396,7 +532,13 @@ class MultiAgentOrchestrator:
             session.commit()
         return message_id
 
-    async def _save_relationship_state(self, relationship_id: str, memory) -> None:
+    async def _save_relationship_state(
+        self,
+        relationship_id: str,
+        memory,
+        *,
+        event_seq: int | None = None,
+    ) -> bool:
         self._ensure_db()
         now = datetime.utcnow()
         with SessionLocal() as session:
@@ -413,16 +555,86 @@ class MultiAgentOrchestrator:
                         longitudinal=memory.longitudinal,
                         relational=memory.relational,
                         history_summary=memory.history_summary,
+                        version=1,
+                        last_applied_event_seq=event_seq or 0,
                         updated_at=now,
                     )
                 )
+                try:
+                    session.commit()
+                    return True
+                except IntegrityError:
+                    session.rollback()
             else:
-                row.long_term_table = memory.long_term_table
-                row.longitudinal = memory.longitudinal
-                row.relational = memory.relational
-                row.history_summary = memory.history_summary
-                row.updated_at = now
+                if event_seq is not None and event_seq <= row.last_applied_event_seq:
+                    return False
+                expected_version = row.version
+                filters = [
+                    RelationshipState.relationship_id == relationship_id,
+                    RelationshipState.version == expected_version,
+                ]
+                if event_seq is not None:
+                    filters.append(
+                        RelationshipState.last_applied_event_seq < event_seq
+                    )
+                updated = (
+                    session.query(RelationshipState)
+                    .filter(*filters)
+                    .update(
+                        {
+                            RelationshipState.long_term_table: memory.long_term_table,
+                            RelationshipState.longitudinal: memory.longitudinal,
+                            RelationshipState.relational: memory.relational,
+                            RelationshipState.history_summary: memory.history_summary,
+                            RelationshipState.version: expected_version + 1,
+                            RelationshipState.last_applied_event_seq: (
+                                event_seq
+                                if event_seq is not None
+                                else row.last_applied_event_seq
+                            ),
+                            RelationshipState.updated_at: now,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                session.commit()
+                return updated == 1
+
+        # A concurrent request may have inserted the row after our first read.
+        with SessionLocal() as session:
+            row = (
+                session.query(RelationshipState)
+                .filter(RelationshipState.relationship_id == relationship_id)
+                .one()
+            )
+            if event_seq is not None and event_seq <= row.last_applied_event_seq:
+                return False
+            expected_version = row.version
+            updated = (
+                session.query(RelationshipState)
+                .filter(
+                    RelationshipState.relationship_id == relationship_id,
+                    RelationshipState.version == expected_version,
+                )
+                .update(
+                    {
+                        RelationshipState.long_term_table: memory.long_term_table,
+                        RelationshipState.longitudinal: memory.longitudinal,
+                        RelationshipState.relational: memory.relational,
+                        RelationshipState.history_summary: memory.history_summary,
+                        RelationshipState.version: expected_version + 1,
+                        RelationshipState.last_applied_event_seq: (
+                            event_seq
+                            if event_seq is not None
+                            else row.last_applied_event_seq
+                        ),
+                        RelationshipState.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
+            )
             session.commit()
+            return updated == 1
 
     async def _save_wallpaper_log(self, run_id: str, message_id: str, relationship_id: str, semantic, image) -> None:
         self._ensure_db()

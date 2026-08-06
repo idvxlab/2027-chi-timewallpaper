@@ -15,6 +15,8 @@ class SemanticGraph:
         self.version = payload.get("version", "unknown")
         self.layers = payload.get("mapping_layers", payload.get("layers", {}))
         self.composition_contract = payload.get("composition_contract", {})
+        self.role_scoped_l1_mapping = payload.get("role_scoped_l1_mapping", {})
+        self.deterministic_l2_parameters = payload.get("deterministic_l2_parameters", {})
         self.content_type_policy = payload.get("content_type_policy", {})
         self.rules = payload.get("rules", payload.get("variables", []))
         self.variables = self.rules

@@ -85,6 +85,55 @@ uvicorn app.main:app --reload --port 8000
 
 后端首次启动会自动创建 SQLite `backend/data/app.db`,用于触碰/ASR 日志。
 
+### 数据库配置与迁移
+
+后端统一读取 `DATABASE_URL`。当前本机开发配置使用 MySQL；如需临时回退到 SQLite：
+
+```dotenv
+DATABASE_URL=sqlite:///./data/app.db
+```
+
+修改数据库模型后，或第一次连接 MySQL 时，在 `backend/` 目录执行迁移：
+
+```bash
+alembic upgrade head
+```
+
+Docker Compose 已配置 MySQL 8.4 LTS。启动 MySQL 并执行迁移：
+
+```bash
+docker compose up -d mysql
+docker compose run --rm backend alembic upgrade head
+docker compose up -d backend frontend
+```
+
+Docker 内部使用的连接地址是：
+
+```dotenv
+DATABASE_URL=mysql+pymysql://timewallpaper:timewallpaper@mysql:3306/timewallpaper?charset=utf8mb4
+```
+
+如果后端直接在 macOS/Windows/Linux 上运行，而 MySQL 在本机或云端，请在
+`backend/.env` 中改成实际地址（本机通常使用 `127.0.0.1`，不能使用 Docker 服务名
+`mysql`）：
+
+```dotenv
+DATABASE_URL=mysql+pymysql://用户名:密码@127.0.0.1:3306/数据库名?charset=utf8mb4
+```
+
+SQLite 适合单机开发；多进程部署和多个家庭设备同时使用时应使用 MySQL。迁移只修改
+表结构，不会把现有 SQLite 数据自动复制到 MySQL；正式切换前需要另做一次数据导入。
+
+从现有 SQLite 一次性导入 MySQL（会先清空目标 MySQL 中的业务数据，SQLite 不受影响）：
+
+```bash
+cd backend
+python scripts/migrate_sqlite_to_mysql.py \
+  --sqlite ./data/app.db \
+  --mysql-url 'mysql+pymysql://timewallpaper:密码@127.0.0.1:3306/timewallpaper?charset=utf8mb4' \
+  --clear-target
+```
+
 ### 3. 启动前端
 
 ```bash

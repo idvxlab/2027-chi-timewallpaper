@@ -7,6 +7,7 @@ frontend/node_modules/
 dist/
 build/
 __pycache__/
+.venv-mac/
 *.pyc
 *.pyo
 *.pyd

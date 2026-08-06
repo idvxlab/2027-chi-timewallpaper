@@ -1,14 +1,70 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import (
+    APIRouter,
+    Cookie,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 
-from app.schemas.agent import CharacterAssetListOut, CharacterAssetOut
+from app.core.character_asset_events import character_asset_event_hub
+from app.schemas.agent import (
+    CharacterAssetListOut,
+    CharacterAssetOut,
+    RelationshipCharacterAssetsOut,
+)
 from app.services.character_asset_service import character_asset_service
+from app.services.session_service import (
+    SESSION_COOKIE_NAME,
+    SessionAuthenticationError,
+    get_current_session,
+)
 
 
 router = APIRouter()
+
+
+@router.websocket("/current-relationship/events")
+async def current_relationship_character_asset_events(websocket: WebSocket) -> None:
+    session_token = websocket.cookies.get(SESSION_COOKIE_NAME)
+    try:
+        identity = get_current_session(session_token)
+    except SessionAuthenticationError:
+        await websocket.close(code=4401)
+        return
+
+    relationship_id = str(identity["relationship_id"])
+    queue = character_asset_event_hub.subscribe(relationship_id)
+    await websocket.accept()
+
+    async def send_events() -> None:
+        while True:
+            event = await queue.get()
+            await websocket.send_json(event)
+
+    sender = asyncio.create_task(send_events())
+    try:
+        await websocket.send_json(
+            {
+                "type": "character_asset_changed",
+                "relationshipId": relationship_id,
+                "status": "connected",
+            }
+        )
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        sender.cancel()
+        character_asset_event_hub.unsubscribe(relationship_id, queue)
 
 
 def _to_output(row) -> CharacterAssetOut:
@@ -28,6 +84,57 @@ def _to_output(row) -> CharacterAssetOut:
         is_active=row.is_active,
         created_at=row.created_at,
         updated_at=row.updated_at,
+    )
+
+
+def _current_identity(session_token: Optional[str]) -> dict[str, object]:
+    try:
+        return get_current_session(session_token)
+    except SessionAuthenticationError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@router.post("/me", response_model=CharacterAssetOut)
+async def create_my_character_asset(
+    image: UploadFile = File(...),
+    session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+) -> CharacterAssetOut:
+    identity = _current_identity(session_token)
+    source_bytes = await image.read()
+    row = await character_asset_service.create(
+        user_id=str(identity["user_id"]),
+        role=str(identity["viewer_role"]),
+        relationship_id=str(identity["relationship_id"]),
+        source_bytes=source_bytes,
+        source_content_type=image.content_type or "image/png",
+        source_filename=image.filename,
+    )
+    return _to_output(row)
+
+
+@router.get(
+    "/current-relationship",
+    response_model=RelationshipCharacterAssetsOut,
+)
+async def list_current_relationship_character_assets(
+    session_token: Optional[str] = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+) -> RelationshipCharacterAssetsOut:
+    identity = _current_identity(session_token)
+    relationship_id = str(identity["relationship_id"])
+    rows = character_asset_service.list_latest_for_relationship(relationship_id)
+    by_role = {row.role: _to_output(row) for row in rows}
+    elder = by_role.get("elder")
+    child = by_role.get("child")
+    return RelationshipCharacterAssetsOut(
+        relationship_id=relationship_id,
+        ready=bool(
+            elder
+            and child
+            and elder.status == "ready"
+            and child.status == "ready"
+        ),
+        elder=elder,
+        child=child,
     )
 
 

@@ -1,16 +1,16 @@
 {
-  "version": "chi-semantic-visual-graph-v3",
+  "version": "chi-semantic-visual-graph-v4",
   "title": "CHI Two-Table to Five-Layer Visual Mapping Graph",
   "purpose": "把短期语义表和长期关系表中的语义变量，直接映射到 L1-L5 五个视觉构成层。图谱不重新理解原文，不引入 C1-C6 中间层。",
   "composition_contract": {
     "format": "vertical_9_16_wallpaper",
     "left_bottom_zone": {
-      "role": "current_side_actor",
-      "description": "当前端人物固定在左下角。父母端为父母，子女端为子女。",
-      "bbox": [0.04, 0.58, 0.42, 0.96],
+      "role": "elder_actor",
+      "description": "父母人物位于共享壁纸中央安全构图区的左侧，两端看到相同布局；不得贴近或越过左边缘。",
+      "bbox": [0.20, 0.48, 0.50, 0.94],
       "target_area_ratio": 0.30,
-      "character_scale_rule": "左下当前端人物只占左下区域内部空间的1/2到2/3，保留足够事件物件和生活环境。",
-      "expression_requirement": "必须能看清当前端人物脸部和表情，但人物不要正脸直视镜头。"
+      "character_scale_rule": "父母人物头到脚高度保持为完整方形画布的34%到40%，不得因关系档位或场景留白而被放大。",
+      "expression_requirement": "必须能看清父母人物脸部和表情，但人物不要正脸直视镜头。"
     },
     "center_zone": {
       "role": "relationship_mapping",
@@ -19,16 +19,17 @@
       "target_area_ratio": 0.20
     },
     "upper_right_zone": {
-      "role": "other_side_actor_or_space",
-      "description": "另一方位于右上角，区域必须明显比左下角更大，可以是人物、生活空间或半透明想象场景。",
-      "bbox": [0.34, 0.04, 0.98, 0.54],
+      "role": "child_actor_or_space",
+      "description": "子女人物位于共享壁纸中央安全构图区的右侧偏上，人物整体向左收，不贴近或越过右边缘；可以是人物、生活空间或半透明想象场景。",
+      "bbox": [0.50, 0.08, 0.80, 0.60],
       "scale": "dominant_space_area",
       "target_area_ratio": 0.50,
-      "relative_area_rule": "右上区域约占画面50%，是最大视觉区域；左下区域约占30%，中间路径约占20%。右上人物占右上区域内部空间的1/2到2/3。",
-      "expression_requirement": "必须能看清另一方人物脸部和表情；如果是生活空间，也必须包含清晰可见的人物脸部；人物不要正脸直视镜头；人物周围要保留生活环境和事件细节。"
+      "relative_area_rule": "子女一侧可保留更多生活环境，但子女人物头到脚高度仍保持为完整方形画布的34%到40%，不得因区域较大而放大。",
+      "expression_requirement": "必须能看清子女人物脸部和表情；如果是生活空间，也必须包含清晰可见的人物脸部；人物不要正脸直视镜头；人物周围要保留生活环境和事件细节。"
     },
     "character_framing": {
-      "scale_rule": "右上和左下都采用区域内人物占比规则：人物占各自区域内部空间的1/2到2/3。",
+      "scale_rule": "两端人物头到脚高度统一保持为完整方形画布的34%到40%，任一人物不得超过42%；关系五档只改变人物间距和平台关系，不改变人物尺度。",
+      "body_completeness_rule": "双方采用完整头身构图；平台前沿位于人物身体下方，不得从腰部或躯干截断人物；桌子、购物篮、座椅等有意义的活动道具可以自然遮挡腰部以下。",
       "expression_rule": "双方脸部和情绪都要可读，但不要做正面证件照或自拍式凝视。",
       "gaze_rule": "人物不要正脸直视镜头；视线应自然看向画面内事件、物件、路径、窗外、天空、远处、手中的东西或画面外侧。",
       "camera_feeling": "像安静观察到的生活瞬间，不是摆拍肖像。"
@@ -46,10 +47,13 @@
       "证件照式肖像",
       "摆拍肖像",
       "双方近距离团圆合照",
-      "右上角人物过小",
-      "左下角人物接近或超过右上人物尺度",
+      "任一人物过小或超过全画布高度42%",
+      "子女人物贴住右边、头发或身体被右边框裁切",
+      "两端人物因关系档位不同而改变尺度",
       "人物背影或脸部不可见",
       "表情不可读",
+      "平台边缘从人物腰部或躯干截断身体",
+      "人物像半身像一样从平台中悬浮出现",
       "手机通话画面",
       "视频通话画面",
       "举着手机对话",
@@ -64,6 +68,332 @@
       "只有发光粒子没有实际路径结构",
       "字幕"
     ]
+  },
+  "role_scoped_l1_mapping": {
+    "version": "role-l1-v1",
+    "description": "父母与子女各自保留独立的最新短期表环境状态；当前说话者只更新自己的区域，另一方沿用其最新记录。",
+    "role_zones": {
+      "elder": {
+        "label": "父母/老人",
+        "zone": "left_bottom",
+        "environment_extension": "continuous_left_scene"
+      },
+      "child": {
+        "label": "子女",
+        "zone": "upper_right",
+        "environment_extension": "continuous_right_scene"
+      }
+    },
+    "time_profiles": [
+      {
+        "id": "dawn",
+        "matches": ["清晨", "早晨", "早上", "黎明"],
+        "brightness": 0.65,
+        "color_temperature": "soft_dawn_gold",
+        "sky_state": "pale_dawn",
+        "celestial_marker": "one small rising sun near the local horizon",
+        "default_lamp_state": "off",
+        "update_policy": "apply"
+      },
+      {
+        "id": "daytime",
+        "matches": ["白天", "中午", "午间", "上午"],
+        "brightness": 0.9,
+        "color_temperature": "neutral_warm_daylight",
+        "sky_state": "bright_day",
+        "celestial_marker": "one clearly visible warm sun in the local daytime sky",
+        "default_lamp_state": "off",
+        "update_policy": "apply"
+      },
+      {
+        "id": "afternoon",
+        "matches": ["下午", "午后"],
+        "brightness": 0.72,
+        "color_temperature": "warm_side_light",
+        "sky_state": "soft_afternoon",
+        "celestial_marker": "one warm sun visibly descending in the local afternoon sky",
+        "default_lamp_state": "off",
+        "update_policy": "apply"
+      },
+      {
+        "id": "dusk",
+        "matches": ["黄昏", "傍晚", "日落"],
+        "brightness": 0.5,
+        "color_temperature": "peach_orange_dusk",
+        "sky_state": "sunset",
+        "celestial_marker": "one clearly visible orange setting sun near the local horizon",
+        "default_lamp_state": "contextual",
+        "update_policy": "apply"
+      },
+      {
+        "id": "evening",
+        "matches": ["晚上", "夜晚", "入夜"],
+        "brightness": 0.3,
+        "color_temperature": "cool_blue_night",
+        "sky_state": "night",
+        "celestial_marker": "one clearly visible gentle moon in the local night sky",
+        "default_lamp_state": "contextual",
+        "update_policy": "apply"
+      },
+      {
+        "id": "late_night",
+        "matches": ["深夜", "半夜", "凌晨"],
+        "brightness": 0.18,
+        "color_temperature": "deep_blue_moonlight",
+        "sky_state": "deep_night",
+        "celestial_marker": "one clearly visible gentle moon in the local deep-night sky",
+        "default_lamp_state": "contextual",
+        "update_policy": "apply"
+      },
+      {
+        "id": "vague_calendar_time",
+        "matches": ["今天", "这周", "本周", "周末", "节日", "季节"],
+        "brightness": null,
+        "color_temperature": "preserve_previous",
+        "sky_state": "preserve_previous",
+        "celestial_marker": "preserve_previous",
+        "default_lamp_state": "preserve_previous",
+        "update_policy": "preserve_previous_exact_time"
+      }
+    ],
+    "lamp_state_rules": {
+      "force_off_when": ["关灯", "熄灯", "睡觉", "入睡", "准备休息", "离开办公室", "下班离开"],
+      "force_on_when": ["加班", "工作", "学习", "看书", "阅读", "做饭", "值班", "开会"],
+      "rule": "夜晚只降低环境亮度；是否开灯由事件和物件语义决定，不能仅凭晚上自动熄灯。"
+    },
+    "scene_profiles": [
+      {
+        "id": "supermarket",
+        "matches": ["超市", "商场", "菜市场"],
+        "anchors": ["简化纸雕货架", "购物篮", "连续过道灯"],
+        "avoid": ["价格文字", "品牌商标", "复杂包装文字"]
+      },
+      {
+        "id": "workplace",
+        "matches": ["单位", "办公室", "公司", "工作场所"],
+        "anchors": ["办公桌", "电脑", "文件架"],
+        "avoid": ["公司标志", "屏幕文字", "密集文件文字"]
+      },
+      {
+        "id": "home",
+        "matches": ["家", "家庭", "客厅", "卧室"],
+        "anchors": ["沙发或床榻", "窗户", "台灯"],
+        "avoid": ["豪华样板间", "无生活痕迹的空房间"]
+      },
+      {
+        "id": "hospital",
+        "matches": ["医院", "诊所"],
+        "anchors": ["候诊椅", "导诊台轮廓", "走廊灯"],
+        "avoid": ["医院文字", "医疗诊断文字", "恐怖医疗画面"]
+      },
+      {
+        "id": "park",
+        "matches": ["公园", "小区花园", "社区花园"],
+        "anchors": ["长椅", "树木", "步道"],
+        "avoid": ["无关大型游乐设施", "拥挤人群"]
+      },
+      {
+        "id": "community",
+        "matches": ["社区", "社区活动室"],
+        "anchors": ["活动桌椅", "窗边植物", "社区小路"],
+        "avoid": ["标语文字", "无关群像"]
+      },
+      {
+        "id": "street",
+        "matches": ["街道", "通勤", "路上"],
+        "anchors": ["连续道路", "路边树木", "简化建筑轮廓"],
+        "avoid": ["路牌文字", "广告牌", "车辆品牌"]
+      },
+      {
+        "id": "kitchen",
+        "matches": ["厨房", "做饭"],
+        "anchors": ["料理台", "锅具", "餐具"],
+        "avoid": ["包装文字", "杂乱堆满画面"]
+      }
+    ],
+    "transition_contract": {
+      "rule": "两端可以有不同时间与场景，但必须处于同一个连续纸雕世界；日夜变化沿道路、溪流、山体和重叠纸层进行柔和过渡。",
+      "minimum_transition_width_px": 160,
+      "forbid": ["垂直日夜分界线", "左右拼贴", "三联画", "独立画板", "笔直色差边界"]
+    }
+  },
+  "deterministic_l2_parameters": {
+    "version": "deterministic-l2-v1",
+    "description": "长期关系字段先转换成0到1的确定性分数，再映射为空间距离、共享空间、路径与花木参数，避免由模型自由解释。",
+    "default_confidence": 0.65,
+    "components": {
+      "intimacy_distance": {
+        "field": "intimacy_distance",
+        "weight": 0.35,
+        "fallback_score": 0.5,
+        "value_scores": {
+          "最远": 0.05,
+          "远": 0.15,
+          "边界感增强": 0.25,
+          "比较远": 0.3,
+          "稍远": 0.35,
+          "不近不远": 0.5,
+          "比较近": 0.7,
+          "近": 0.75,
+          "最近": 0.9,
+          "共享空间变大": 0.9
+        },
+        "visual_responsibility": ["zoneGapRatio", "sharedSpaceRatio", "pathLength"]
+      },
+      "emotional_warmth": {
+        "field": "emotional_warmth",
+        "weight": 0.25,
+        "fallback_score": 0.5,
+        "value_scores": {
+          "冷淡": 0.15,
+          "疏离": 0.25,
+          "需要安慰": 0.45,
+          "稳定": 0.65,
+          "温暖但克制": 0.75,
+          "温暖": 0.9
+        },
+        "visual_responsibility": ["flowerColor", "connectionColorTemperature", "bloomRatio"]
+      },
+      "interaction_frequency": {
+        "field": "interaction_frequency",
+        "weight": 0.15,
+        "fallback_score": 0.5,
+        "value_scores": {
+          "长时间未联系": 0.15,
+          "联系减少": 0.3,
+          "偶尔联系": 0.45,
+          "突然密集": 0.75,
+          "经常联系": 0.9
+        },
+        "visual_responsibility": ["flowerDensity", "budDensity", "pathLightNodeDensity"]
+      },
+      "reciprocity": {
+        "field": "reciprocity",
+        "weight": 0.1,
+        "fallback_score": 0.5,
+        "value_scores": {
+          "不平衡": 0.25,
+          "单向": 0.3,
+          "逐渐恢复": 0.65,
+          "双向": 0.9
+        },
+        "visual_responsibility": ["twoSideFlowerBalance", "pathFlowSymmetry"]
+      },
+      "relationship_trend": {
+        "field": "relationship_trend",
+        "weight": 0.15,
+        "fallback_score": 0.5,
+        "value_scores": {
+          "疏远": 0.15,
+          "暂时疏远": 0.3,
+          "停滞": 0.4,
+          "稳定": 0.65,
+          "修复": 0.8,
+          "靠近": 0.9
+        },
+        "visual_responsibility": ["newBloomDirection", "pathGrowth", "fallingPetalDensity"]
+      }
+    },
+    "controls": {
+      "flowerDensity": {"min": 0.15, "max": 0.85, "driver": "relationship_score", "direction": "increasing"},
+      "bloomRatio": {"min": 0.2, "max": 0.85, "driver": "relationship_score", "direction": "increasing"},
+      "zoneGapRatio": {"min": 0.08, "max": 0.32, "driver": "relationship_score", "direction": "decreasing"},
+      "sharedSpaceRatio": {"min": 0.08, "max": 0.24, "driver": "relationship_score", "direction": "increasing"},
+      "pathLength": {"min": 0.35, "max": 0.75, "driver": "relationship_score", "direction": "decreasing"},
+      "pathWidth": {"min": 0.04, "max": 0.1, "driver": "relationship_score", "direction": "increasing"},
+      "connectionBrightness": {"min": 0.35, "max": 0.85, "driver": "relationship_score", "direction": "increasing"},
+      "pathLightNodeDensity": {"min": 0.1, "max": 0.8, "driver": "interaction_frequency", "direction": "increasing"},
+      "twoSideFlowerBalance": {"min": 0.25, "max": 0.95, "driver": "reciprocity", "direction": "increasing"}
+    },
+    "spatial_modes": {
+      "driver": "intimacy_distance",
+      "driver_score": "rawScore",
+      "merged_min_score": 0.85,
+      "path_only_min_score": 0.65,
+      "river_and_path_min_score": 0.4,
+      "river_only_min_score": 0.2,
+      "layout_interpolation": {
+        "elder_anchor": {
+          "far": [0.20, 0.76],
+          "near": [0.48, 0.58]
+        },
+        "child_anchor": {
+          "far": [0.80, 0.24],
+          "near": [0.52, 0.46]
+        },
+        "elder_platform_anchor": {
+          "far": [0.08, 0.90],
+          "near": [0.45, 0.74]
+        },
+        "child_platform_anchor": {
+          "far": [0.92, 0.43],
+          "near": [0.55, 0.64]
+        },
+        "person_gap_ratio": {
+          "far": 0.7,
+          "near": 0.06
+        },
+        "platform_gap_ratio": {
+          "far": 0.58,
+          "near": 0.0
+        },
+        "platform_overlap_ratio": {
+          "far": 0.0,
+          "near": 0.22
+        },
+        "shared_ground_ratio": {
+          "far": 0.0,
+          "near": 0.95
+        },
+        "shared_scene_ratio": {
+          "far": 0.05,
+          "near": 0.85
+        },
+        "environment_merge_ratio": {
+          "far": 0.0,
+          "near": 0.9
+        }
+      },
+      "mode_overrides": {
+        "merged": {"zoneGapRatio": 0.0, "pathLength": 0.0, "pathWidth": 0.0},
+        "path_only": {"pathLength": 0.22, "pathWidth": 0.05},
+        "river_and_path": {},
+        "river_only": {"pathLength": 0.0, "pathWidth": 0.0},
+        "peripheral": {"pathLength": 0.0, "pathWidth": 0.0}
+      },
+      "layout_mode_profiles": {
+        "merged": {"elderAnchorX": 0.47, "childAnchorX": 0.53, "elderPlatformAnchorX": 0.46, "childPlatformAnchorX": 0.54, "personGapRatio": 0.06, "platformGapRatio": 0.0, "platformOverlapRatio": 0.18, "sharedGroundRatio": 0.9},
+        "path_only": {"elderAnchorX": 0.45, "childAnchorX": 0.55, "elderPlatformAnchorX": 0.43, "childPlatformAnchorX": 0.57, "personGapRatio": 0.1, "platformGapRatio": 0.06, "platformOverlapRatio": 0.0, "sharedGroundRatio": 0.65},
+        "river_and_path": {"elderAnchorX": 0.43, "childAnchorX": 0.57, "elderPlatformAnchorX": 0.39, "childPlatformAnchorX": 0.61, "personGapRatio": 0.14, "platformGapRatio": 0.14, "platformOverlapRatio": 0.0, "sharedGroundRatio": 0.35},
+        "river_only": {"elderAnchorX": 0.41, "childAnchorX": 0.59, "elderPlatformAnchorX": 0.35, "childPlatformAnchorX": 0.65, "personGapRatio": 0.18, "platformGapRatio": 0.22, "platformOverlapRatio": 0.0, "sharedGroundRatio": 0.15},
+        "peripheral": {"elderAnchorX": 0.39, "childAnchorX": 0.61, "elderPlatformAnchorX": 0.31, "childPlatformAnchorX": 0.69, "personGapRatio": 0.22, "platformGapRatio": 0.3, "platformOverlapRatio": 0.0, "sharedGroundRatio": 0.02}
+      },
+      "mode_rules": {
+        "merged": "最近：两块生活平台、人物、家具和场景边缘融合为同一片共享地面；移除两人之间的道路、河流、溪流、桥、沟壑和留白。",
+        "path_only": "比较近：两块生活平台明显靠近，中间只保留一条短而窄的生活小路；不得出现河流、溪流、桥或沟壑。",
+        "river_and_path": "不近不远：两块生活平台保持中等距离，中间同时保留一条河流和一条可读的小路。",
+        "river_only": "比较远：两块生活平台进一步拉开，中间只保留河水作为距离；不得出现连接小路或桥。",
+        "peripheral": "最远：两块生活平台保持较远，中央以宽阔河流表达大尺度距离且不建立小路或桥；两个人物仍须位于中央显示安全区内，不得靠近或越过画布边缘。"
+      }
+    },
+    "flower_color_palettes": {
+      "cool": ["dusty_blue", "gray_green"],
+      "stable": ["cream", "sage_green", "pale_yellow"],
+      "warm": ["soft_peach", "pale_coral", "warm_yellow"]
+    },
+    "semantic_separation": {
+      "intimacy_distance": "主要控制两个空间的距离、共享空间和路径长度。",
+      "emotional_warmth": "主要控制花朵颜色、连接色温和开放程度。",
+      "interaction_frequency": "主要控制花朵、新芽和路径光点数量。",
+      "reciprocity": "主要控制两侧花木分布与路径流动是否均衡。",
+      "relationship_trend": "主要控制新花开放、生长方向、落花或停滞。"
+    },
+    "smoothing": {
+      "previous_weight": 0.7,
+      "current_weight": 0.3,
+      "formula": "displayScore = 0.7 * previousScore + 0.3 * currentScore",
+      "note": "本阶段输出当前确定性分数；上一张分数的持久化和平滑在后续壁纸状态接入时启用。"
+    }
   },
   "mapping_layers": {
     "L1": {
@@ -172,12 +502,12 @@
       "values": ["妈妈", "爸爸", "女儿", "儿子", "父母", "子女", "朋友", "邻居", "同事", "社区合唱团"],
       "mapping_layers": ["L4"],
       "aigc_visual_mapping": "人物角色、群体关系、人物相对位置。",
-      "role": "提供人物身份和相对关系；当前端人物仍由端侧硬规则固定在左下角。",
+      "role": "提供人物身份和相对关系；父母位于中央安全区左侧偏下，子女位于中央安全区右侧偏上，双方均不得贴边或越界。",
       "visual_metaphors": [
         {"id": "role_positioning", "description": "人物身份通过年龄、姿态、生活空间和陪伴关系表达。"}
       ],
       "parameters": {"character_identity_stability": "high"},
-      "must_include": ["当前端人物", "另一方人物或生活空间"],
+      "must_include": ["中央安全区左侧偏下的父母人物", "中央安全区右侧偏上的子女人物或生活空间"],
       "avoid": ["无关群像抢占主体"]
     },
     {

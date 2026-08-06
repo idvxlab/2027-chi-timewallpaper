@@ -5,11 +5,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
+from app.core.wallpaper_events import wallpaper_event_hub
 from app.core.cors import build_cors_origins
 from app.db.session import Base, engine
+from app.db.compat import ensure_concurrency_schema
 # noqa: 让 SQLAlchemy 知道要创建哪些表
 import app.db.models  # noqa: F401
-from app.routes import scene, demo, touch, asr, logs, ws, agent_runs, chatbox, character_assets
+from app.routes import scene, demo, touch, asr, logs, ws, agent_runs, chatbox, character_assets, onboarding, relationships, sessions, subject, wallpapers
 
 
 def create_app() -> FastAPI:
@@ -49,7 +51,15 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def _init_db() -> None:
-        Base.metadata.create_all(bind=engine)
+        ensure_concurrency_schema()
+        await wallpaper_event_hub.start()
+
+    @app.on_event("shutdown")
+    async def _shutdown_services() -> None:
+        from app.services.render_queue_service import render_queue_service
+
+        await wallpaper_event_hub.stop()
+        await render_queue_service.close()
 
     app.include_router(scene.router, prefix="/scene", tags=["scene"])
     app.include_router(demo.router, prefix="/demo", tags=["demo"])
@@ -58,6 +68,11 @@ def create_app() -> FastAPI:
     app.include_router(chatbox.router, tags=["chatbox"])
     app.include_router(agent_runs.router, prefix="/agent-runs", tags=["agent-runs"])
     app.include_router(character_assets.router, prefix="/character-assets", tags=["character-assets"])
+    app.include_router(onboarding.router, prefix="/onboarding", tags=["onboarding"])
+    app.include_router(relationships.router, prefix="/relationships", tags=["relationships"])
+    app.include_router(sessions.router, prefix="/sessions", tags=["sessions"])
+    app.include_router(subject.router, prefix="/extract-subject", tags=["subject"])
+    app.include_router(wallpapers.router, prefix="/wallpapers", tags=["wallpapers"])
     app.include_router(logs.router, prefix="/logs", tags=["logs"])
     app.include_router(ws.router, tags=["ws"])
 

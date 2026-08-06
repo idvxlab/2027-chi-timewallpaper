@@ -1,13 +1,75 @@
-version: "3.9"
-
 services:
+  mysql:
+    image: mysql:8.4
+    container_name: tw-mysql
+    environment:
+      MYSQL_DATABASE: timewallpaper
+      MYSQL_USER: timewallpaper
+      MYSQL_PASSWORD: timewallpaper
+      MYSQL_ROOT_PASSWORD: timewallpaper-root
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - tw-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u$${MYSQL_USER} -p$${MYSQL_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: tw-redis
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - tw-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
   backend:
     build: ./backend
     container_name: tw-backend
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - ./backend/.env
+    environment:
+      DATABASE_URL: mysql+pymysql://timewallpaper:timewallpaper@mysql:3306/timewallpaper?charset=utf8mb4
+      REDIS_URL: redis://redis:6379/0
+      RENDER_QUEUE_ENABLED: "true"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    volumes:
+      - ./backend/data:/app/data
+    restart: unless-stopped
+
+  render-worker:
+    build: ./backend
+    container_name: tw-render-worker
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: mysql+pymysql://timewallpaper:timewallpaper@mysql:3306/timewallpaper?charset=utf8mb4
+      REDIS_URL: redis://redis:6379/0
+      RENDER_QUEUE_ENABLED: "true"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["arq", "app.workers.wallpaper.WorkerSettings"]
     volumes:
       - ./backend/data:/app/data
     restart: unless-stopped
@@ -18,7 +80,11 @@ services:
     ports:
       - "3000:3000"
     env_file:
-      - .env
+      - ./frontend/.env.local
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  tw-mysql-data:
+  tw-redis-data:

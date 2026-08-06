@@ -9,74 +9,43 @@ import httpx
 from app.providers.llm import get_llm_provider
 from app.schemas.agent import LanguageEmotionResult
 from app.agents.script_reflection_agent import ScriptReflectionAgent
-from app.services.audio_understanding_tool import analyze_audio_affect
-from app.services.chatbox_asr_service import transcribe_chatbox_audio
-from app.services.user_context import DEFAULT_CHILD_USER_ID, DEFAULT_PARENT_USER_ID
+from app.services.user_context import get_speaker_context
 
 
 class LanguageEmotionAgent:
     def __init__(self) -> None:
         self.reflection_agent = ScriptReflectionAgent()
 
-    async def run(
-        self,
-        audio: bytes,
-        content_type: str,
-        filename: str,
-        run_id: str | None = None,
-        user_id: str | None = None,
-        relationship_id: str | None = None,
-    ) -> LanguageEmotionResult:
-        self._log(run_id, "ChatBox ASR started")
-        asr = await transcribe_chatbox_audio(audio, filename=filename, content_type=content_type, run_id=run_id)
-        self._log(run_id, "ChatBox ASR done")
-        transcript = asr["transcript"]
-
-        voice_affect = None
-        audio_affect_raw = None
-        try:
-            self._log(run_id, "Audio Understanding Tool started")
-            audio_affect = await analyze_audio_affect(
-                audio,
-                filename=filename,
-                content_type=content_type,
-                transcript=transcript,
-                run_id=run_id,
-            )
-            self._log(run_id, "Audio Understanding Tool done")
-            voice_affect = audio_affect.get("voiceAffect")
-            audio_affect_raw = audio_affect.get("raw")
-        except Exception as exc:
-            self._log(run_id, f"Audio Understanding Tool skipped: {type(exc).__name__}: {exc}")
-
-        return await self.run_text(
-            transcript,
-            asr_raw={
-                "asr": asr.get("raw"),
-                "audio_understanding": audio_affect_raw,
-            },
-            voice_affect=voice_affect,
-            run_id=run_id,
-            user_id=user_id,
-            relationship_id=relationship_id,
-        )
-
     async def run_text(
         self,
         transcript: str,
         asr_raw: dict | None = None,
         voice_affect: dict | None = None,
+        reply_override: str | None = None,
         run_id: str | None = None,
         user_id: str | None = None,
         relationship_id: str | None = None,
     ) -> LanguageEmotionResult:
         speaker_context = self._speaker_context(user_id, relationship_id)
         voice_affect = voice_affect or self._voice_affect_from_raw(asr_raw)
-        llm_result = await self._try_llm_understanding(transcript, asr_raw, voice_affect, speaker_context, run_id=run_id)
+        llm_result = await self._try_llm_understanding(
+            transcript,
+            asr_raw,
+            voice_affect,
+            speaker_context,
+            reply_override=reply_override,
+            run_id=run_id,
+        )
         if llm_result is not None:
             return llm_result
         self._log(run_id, "language understanding using rule fallback")
-        return self._rule_understanding(transcript, asr_raw, speaker_context, voice_affect)
+        return self._rule_understanding(
+            transcript,
+            asr_raw,
+            speaker_context,
+            voice_affect,
+            reply_override=reply_override,
+        )
 
     async def _try_llm_understanding(
         self,
@@ -84,6 +53,7 @@ class LanguageEmotionAgent:
         asr_raw: dict | None,
         voice_affect: dict | None,
         speaker_context: dict,
+        reply_override: str | None = None,
         run_id: str | None = None,
     ) -> Optional[LanguageEmotionResult]:
         provider = get_llm_provider()
@@ -129,7 +99,7 @@ Question-Based Table Filler 再综合整体大意、原文语义线索和端侧�
     "time": {{"question": "何时发生？对方当前生活节奏如何？", "answer": "回答", "value": "填表值", "evidence": "证据", "source": "explicit|inferred|default", "confidence": 0.0}},
     "subject": {{"question": "与谁有关？谁在场？", "answer": "回答", "value": ["人物"], "evidence": "证据", "source": "explicit|inferred|default", "confidence": 0.0}},
     "object": {{"question": "哪些物件提示了这件事？", "answer": "回答", "value": ["物件/活动对象/生活线索"], "evidence": "证据", "source": "explicit|inferred|default", "confidence": 0.0}},
-    "momentary_affect": {{"question": "此刻感受如何？", "answer": "回答", "value": "愉悦|平静|悲伤|焦虑|思念|期待|疲惫", "evidence": "证据", "source": "explicit|inferred|default", "confidence": 0.0}},
+    "momentary_affect": {{"question": "此刻感受如何？", "answer": "回答", "value": "愉悦|平静|悲伤|焦虑|思念|期待|疲惫|生气|惊讶", "evidence": "证据", "source": "explicit|inferred|default", "confidence": 0.0}},
     "affective_intensity": {{"question": "这种感受有多强？", "answer": "回答", "value": "轻微|明显|强烈|波动", "evidence": "证据", "source": "explicit|inferred|default", "confidence": 0.0}},
     "affective_ambiguity": {{"question": "这个状态是否容易理解？", "answer": "回答", "value": "明确|含混|难以判断|需要上下文", "evidence": "证据", "source": "explicit|inferred|default", "confidence": 0.0}},
     "intent_type": {{"question": "为什么留下这条信息？", "answer": "回答", "value": "分享生活|表达思念|寻求安慰|倾诉情绪|期待回应", "evidence": "证据", "source": "explicit|inferred|default", "confidence": 0.0}},
@@ -140,8 +110,7 @@ Question-Based Table Filler 再综合整体大意、原文语义线索和端侧�
     "A_situational_semantics": {{}},
     "B_affective_semantics": {{}},
     "C_communicative_semantics": {{}}
-  }},
-  "reply": "一句温柔、简短的中文回应"
+  }}
 }}
 
 规则：
@@ -174,6 +143,10 @@ Question-Based Table Filler 再综合整体大意、原文语义线索和端侧�
                 transcript,
                 speaker_context,
             )
+            short_term_table = self._merge_voice_affect_short_term_table(
+                short_term_table,
+                voice_affect,
+            )
             initial_short_term_table = json.loads(json.dumps(short_term_table, ensure_ascii=False))
             analysis_context = {
                 "gistLayer": data.get("gistLayer") or data.get("gist_layer") or {},
@@ -193,7 +166,7 @@ Question-Based Table Filler 再综合整体大意、原文语义线索和端侧�
                 situation=situation,
                 communication=communication,
                 short_term_table=short_term_table,
-                reply=data.get("reply") or "我听到了，这条近况会被整理成今天的时间壁纸。",
+                reply=reply_override or "我听到了，这条近况会被整理成今天的时间壁纸。",
                 raw={
                     "asr": asr_raw,
                     "audio_understanding": {"voiceAffect": voice_affect or {}},
@@ -385,6 +358,7 @@ Question-Based Table Filler 再综合整体大意、原文语义线索和端侧�
         asr_raw: dict | None,
         speaker_context: dict | None = None,
         voice_affect: dict | None = None,
+        reply_override: str | None = None,
     ) -> LanguageEmotionResult:
         speaker_context = speaker_context or self._speaker_context(None, None)
         lowered = transcript.lower()
@@ -398,7 +372,7 @@ Question-Based Table Filler 再综合整体大意、原文语义线索和端侧�
         short_term_table = self.reflection_agent._apply_revisions(initial_table, reflection)
         short_term_table["reflectionPolicy"] = "Reflection Agent 只检查并修正短期语义表；不生成视觉隐喻，不向 Designer 或 History Reasoner 提供额外输入。"
         situation, emotion, communication = self._payloads_from_short_loop(short_term_table, {}, transcript, voice_affect)
-        reply = "我听到了，这条近况会被整理成今天的时间壁纸。"
+        reply = reply_override or "我听到了，这条近况会被整理成今天的时间壁纸。"
 
         return LanguageEmotionResult(
             transcript=transcript,
@@ -450,7 +424,7 @@ Question-Based Table Filler 再综合整体大意、原文语义线索和端侧�
             if not value:
                 continue
             current = result.get(field)
-            if isinstance(current, dict) and current.get("source") == "explicit" and current.get("confidence", 0) >= confidence:
+            if isinstance(current, dict) and current.get("source") == "explicit":
                 continue
             result[field] = {
                 "value": value,
@@ -465,27 +439,74 @@ Question-Based Table Filler 再综合整体大意、原文语义线索和端侧�
         cues = voice_affect.get("vocalCues")
         cue_text = "、".join(str(item) for item in cues if str(item).strip()) if isinstance(cues, list) else ""
         tone = str(voice_affect.get("tone") or "").strip()
-        parts = [part for part in [tone, cue_text] if part]
+        provider_emotion = str(voice_affect.get("providerEmotion") or "").strip()
+        mapped_emotion = str(voice_affect.get("emotion") or "").strip()
+        mapped_text = (
+            f"豆包流式情绪={provider_emotion}，确定性映射={mapped_emotion}"
+            if provider_emotion and mapped_emotion
+            else ""
+        )
+        parts = [part for part in [mapped_text, tone, cue_text] if part]
         return "音频语气线索：" + ("；".join(parts) if parts else "模型判断说话语气")
 
+    def _merge_voice_affect_short_term_table(
+        self,
+        short_term_table: dict,
+        voice_affect: dict | None,
+    ) -> dict:
+        if not isinstance(voice_affect, dict):
+            return short_term_table
+        emotion = str(voice_affect.get("emotion") or "").strip()
+        if emotion not in {"愉悦", "平静", "悲伤", "焦虑", "思念", "期待", "疲惫", "生气", "惊讶"}:
+            return short_term_table
+        try:
+            confidence = float(voice_affect.get("confidence") or 0)
+        except (TypeError, ValueError):
+            return short_term_table
+        if confidence <= 0:
+            return short_term_table
+
+        result = json.loads(json.dumps(short_term_table, ensure_ascii=False))
+        section = result.setdefault("B_affective_semantics", {})
+        current = section.get("momentary_affect")
+        if isinstance(current, dict) and current.get("source") == "explicit":
+            return result
+        section["momentary_affect"] = {
+            "value": emotion,
+            "evidence": self._voice_affect_evidence(voice_affect),
+            "confidence": round(max(0.35, min(0.85, confidence)), 2),
+            "source": "inferred",
+            "origin": "doubao_streaming_audio",
+        }
+        return result
+
     def _conservative_emotion(self, transcript: str, voice_affect: dict | None = None) -> str:
-        if any(word in transcript for word in ("开心", "高兴", "快乐", "顺利")):
-            return "愉悦"
-        if any(word in transcript for word in ("累", "疲惫", "困", "熬夜")):
-            return "疲惫"
-        if any(word in transcript for word in ("难过", "伤心", "不舒服")):
-            return "悲伤"
-        if any(word in transcript for word in ("想", "想念", "牵挂")):
-            return "思念"
+        explicit_emotion = self._explicit_text_emotion(transcript)
+        if explicit_emotion:
+            return explicit_emotion
         voice_emotion = str((voice_affect or {}).get("emotion") or "")
-        if voice_emotion in {"愉悦", "平静", "悲伤", "焦虑", "思念", "期待", "疲惫"}:
+        if voice_emotion in {"愉悦", "平静", "悲伤", "焦虑", "思念", "期待", "疲惫", "生气", "惊讶"}:
             return voice_emotion
         return "平静"
 
+    def _explicit_text_emotion(self, transcript: str) -> str:
+        for words, emotion in (
+            (("开心", "高兴", "快乐", "顺利"), "愉悦"),
+            (("累", "疲惫", "困", "熬夜"), "疲惫"),
+            (("难过", "伤心", "不舒服"), "悲伤"),
+            (("想念", "牵挂", "想家"), "思念"),
+            (("生气", "恼火", "愤怒"), "生气"),
+            (("惊讶", "意外", "没想到"), "惊讶"),
+        ):
+            if any(word in transcript for word in words):
+                return emotion
+        return ""
+
     def _conservative_question_answers(self, transcript: str, speaker_context: dict, emotion_type: str) -> dict:
         evidence = "表格枚举兜底：LLM 不可用或调用失败，只从短期表 Values/States 中选择"
-        affect_source = "explicit" if emotion_type != "平静" else "default"
-        affect_confidence = 0.55 if emotion_type != "平静" else 0.35
+        explicit_affect = bool(self._explicit_text_emotion(transcript))
+        affect_source = "explicit" if explicit_affect else ("inferred" if emotion_type != "平静" else "default")
+        affect_confidence = 0.55 if explicit_affect else (0.45 if emotion_type != "平静" else 0.35)
         intent_type = "倾诉情绪" if emotion_type in {"疲惫", "悲伤"} else "分享生活"
         disclosure_depth = "情绪透露" if emotion_type in {"疲惫", "悲伤", "思念"} else "日常分享"
         desired_response = "安慰或轻触回应" if emotion_type in {"疲惫", "悲伤"} else "看见即可"
@@ -842,24 +863,7 @@ Question-Based Table Filler 再综合整体大意、原文语义线索和端侧�
         return str(speaker_context.get("speaker_label") or "当前说话者")
 
     def _speaker_context(self, user_id: str | None, relationship_id: str | None) -> dict:
-        role = "unknown"
-        speaker_label = "当前说话者"
-        counterpart_label = "对方"
-        if user_id == DEFAULT_PARENT_USER_ID:
-            role = "parent"
-            speaker_label = "妈妈"
-            counterpart_label = "女儿"
-        elif user_id == DEFAULT_CHILD_USER_ID:
-            role = "child"
-            speaker_label = "女儿"
-            counterpart_label = "妈妈"
-        return {
-            "user_id": user_id or "",
-            "relationship_id": relationship_id or "",
-            "speaker_role": role,
-            "speaker_label": speaker_label,
-            "counterpart_label": counterpart_label,
-        }
+        return get_speaker_context(user_id, relationship_id)
 
     def _fallback_actors(self, transcript: str, speaker_context: dict) -> list[str]:
         actors = [speaker_context.get("speaker_label") or "当前说话者"]

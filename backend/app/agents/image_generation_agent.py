@@ -7,6 +7,14 @@ from app.services.pipeline_service import generate_wallpaper_from_prompt
 
 
 class ImageGenerationAgent:
+    RELATIONSHIP_REFLOW_MODES = {
+        "merged",
+        "path_only",
+        "river_and_path",
+        "river_only",
+        "peripheral",
+    }
+
     async def run_base_scene(self, run_id: str | None = None) -> ImageGenerationResult:
         self._log(run_id, "painter tool selector: tool=base_scene_only")
         result = await layered_painter_tools.generate_base_scene()
@@ -36,10 +44,37 @@ class ImageGenerationAgent:
         previous_image_url: str | None = None,
         role_reference_images: dict[str, str | None] | None = None,
         run_id: str | None = None,
+        generation_stage: str | None = None,
+        speaker_role: str | None = None,
     ) -> ImageGenerationResult:
-        regions = self._plan_regions(semantic_mapping.semantic_visual_instruction)
-        masks = self._plan_masks(regions)
+        regions = self._plan_regions(
+            semantic_mapping.semantic_visual_instruction,
+            five_layer_plan=self._five_layer_plan(semantic_mapping),
+            generation_stage=generation_stage,
+            speaker_role=speaker_role or self._current_role(semantic_mapping),
+        )
         self._log(run_id, f"image region planning done regions={','.join(region['region_id'] for region in regions)}")
+
+        if generation_stage in {"first_voice", "subsequent_update"}:
+            layered = await self._try_layered_painter_tool(
+                semantic_mapping=semantic_mapping,
+                prompt="",
+                previous_image_url=previous_image_url,
+                role_reference_images=role_reference_images,
+                regions=regions,
+                run_id=run_id,
+                generation_stage=generation_stage,
+                speaker_role=speaker_role,
+            )
+            if layered is None:
+                operation = (
+                    "two-pass initialization"
+                    if generation_stage == "first_voice"
+                    else "single-pass regional update"
+                )
+                raise RuntimeError(f"Seedream {operation} failed")
+            return layered
+
         safe_instruction = self._soften_instruction(semantic_mapping.semantic_visual_instruction)
         prompt = self._build_prompt(
             safe_instruction,
@@ -58,18 +93,6 @@ class ImageGenerationAgent:
         reference_urls = self._reference_urls(role_reference_images)
         if reference_urls:
             self._log(run_id, f"image reference inputs roles={','.join(reference_urls.keys())}")
-        layered = await self._try_layered_painter_tool(
-            semantic_mapping=semantic_mapping,
-            prompt=prompt,
-            previous_image_url=previous_image_url,
-            role_reference_images=role_reference_images,
-            regions=regions,
-            masks=masks,
-            run_id=run_id,
-        )
-        if layered is not None:
-            return layered
-
         image = await generate_wallpaper_from_prompt(
             prompt,
             run_id=run_id,
@@ -79,14 +102,16 @@ class ImageGenerationAgent:
 
         return ImageGenerationResult(
             wallpaper_url=wallpaper_url,
-            generation_mode="mask_image2image_mvp",
+            generation_mode="single_prompt_image_mvp",
             changed_regions=[region["region_id"] for region in regions],
             asset_metadata={
                 "parent_image": previous_image_url,
                 "regions": regions,
-                "masks": masks,
+                "masks": [],
                 "prompt": prompt,
                 "role_references": reference_urls,
+                "generation_stage": generation_stage or "",
+                "speaker_role": speaker_role or "",
                 "raw": image.get("raw"),
                 "quality": {
                     "mode": "mvp_rule_check",
@@ -104,90 +129,146 @@ class ImageGenerationAgent:
         previous_image_url: str | None,
         role_reference_images: dict[str, str | None] | None,
         regions: list[dict],
-        masks: list[dict],
         run_id: str | None,
+        generation_stage: str | None,
+        speaker_role: str | None,
     ) -> ImageGenerationResult | None:
         if not settings.layered_image_tools_enabled:
             self._log(run_id, "painter tool selector: fallback=single_prompt_image_api reason=layered_tools_disabled")
             return None
 
-        tool_name = self._select_layered_tool(previous_image_url, role_reference_images)
+        tool_name = self._select_layered_tool(
+            previous_image_url,
+            role_reference_images,
+            generation_stage=generation_stage,
+            speaker_role=speaker_role,
+            five_layer_plan=self._five_layer_plan(semantic_mapping),
+        )
         if tool_name is None:
             self._log(run_id, "painter tool selector: fallback=single_prompt_image_api reason=missing_layered_inputs")
             return None
 
         self._log(run_id, f"painter tool selector: tool={tool_name}")
         try:
-            current_role = self._current_role(semantic_mapping)
-            if tool_name == "base_scene_then_first_voice_compose":
+            current_role = speaker_role or self._current_role(semantic_mapping)
+            if tool_name == "initialize_wallpaper_view":
                 refs = self._reference_urls(role_reference_images)
-                elder_bytes = await layered_painter_tools.resolve_reference_bytes(refs.get("elder"))
-                child_bytes = await layered_painter_tools.resolve_reference_bytes(refs.get("child"))
-                base_result = await layered_painter_tools.generate_base_scene(
-                    self_image_bytes=child_bytes,
-                    partner_image_bytes=elder_bytes,
-                )
-                base_image_url = base_result.get("imageUrl") or ""
-                if not base_image_url:
-                    self._log(run_id, "painter base scene tool returned empty image; fallback=single_prompt_image_api")
-                    return None
-                self._log(run_id, f"painter base scene done imageUrl={base_image_url}")
-                insert_result = await layered_painter_tools.first_voice_compose(
-                    base_image_url=base_image_url,
-                    younger_image_bytes=child_bytes,
-                    elder_image_bytes=elder_bytes,
-                    transcript=self._layered_tool_message(semantic_mapping),
-                    current_role=current_role,
-                )
-                result = {
-                    "imageUrl": insert_result.get("imageUrl") or base_image_url,
-                    "raw": {
-                        "baseScene": base_result.get("raw"),
-                        "insertCharacters": insert_result.get("raw"),
-                    },
-                }
-            elif tool_name == "first_voice_compose":
-                refs = self._reference_urls(role_reference_images)
-                result = await layered_painter_tools.first_voice_compose(
+                result = await layered_painter_tools.initialize_wallpaper_view(
                     base_image_url=previous_image_url or "",
                     younger_image_bytes=await layered_painter_tools.resolve_reference_bytes(refs.get("child")),
                     elder_image_bytes=await layered_painter_tools.resolve_reference_bytes(refs.get("elder")),
-                    transcript=self._layered_tool_message(semantic_mapping),
-                    current_role=current_role,
+                    designer_five_layer_plan=self._five_layer_plan(
+                        semantic_mapping
+                    ),
+                    semantic_visual_instruction=(
+                        semantic_mapping.semantic_visual_instruction
+                    ),
+                    speaker_role=current_role,
+                )
+            elif tool_name == "reflow_shared_relationship_view":
+                refs = self._reference_urls(role_reference_images)
+                result = await layered_painter_tools.reflow_shared_relationship_view(
+                    base_image_url=previous_image_url or "",
+                    younger_image_bytes=await layered_painter_tools.resolve_reference_bytes(
+                        refs.get("child")
+                    ),
+                    elder_image_bytes=await layered_painter_tools.resolve_reference_bytes(
+                        refs.get("elder")
+                    ),
+                    designer_five_layer_plan=self._five_layer_plan(
+                        semantic_mapping
+                    ),
+                    semantic_visual_instruction=(
+                        semantic_mapping.semantic_visual_instruction
+                    ),
+                    speaker_role=current_role,
                 )
             elif tool_name == "update_current_side":
+                refs = self._reference_urls(role_reference_images)
+                speaker_reference = refs.get(self._normalize_role(current_role))
                 result = await layered_painter_tools.update_current_side(
                     base_image_url=previous_image_url or "",
-                    transcript=self._layered_tool_message(semantic_mapping),
-                    current_side="left_bottom",
+                    speaker_image_bytes=await layered_painter_tools.resolve_reference_bytes(
+                        speaker_reference
+                    ),
+                    designer_five_layer_plan=self._five_layer_plan(
+                        semantic_mapping
+                    ),
+                    semantic_visual_instruction=(
+                        semantic_mapping.semantic_visual_instruction
+                    ),
+                    speaker_role=current_role,
                 )
             else:
                 return None
         except Exception as exc:
-            self._log(run_id, f"painter layered tool failed tool={tool_name} error={exc}; fallback=single_prompt_image_api")
+            self._log(
+                run_id,
+                f"painter layered tool failed tool={tool_name} error={exc}",
+            )
             return None
 
-        wallpaper_url = result.get("imageUrl") or previous_image_url or ""
+        raw_result = result.get("raw")
+        raw_metadata = raw_result if isinstance(raw_result, dict) else {}
+        wallpaper_url = result.get("imageUrl") or ""
         if not wallpaper_url:
-            self._log(run_id, f"painter layered tool returned empty image tool={tool_name}; fallback=single_prompt_image_api")
-            return None
+            error_detail = str(
+                raw_metadata.get("error")
+                or f"Seedream returned no wallpaper for {generation_stage}"
+            )
+            raise RuntimeError(error_detail)
 
+        is_seedream_initial = generation_stage == "first_voice"
+        is_seedream_reflow = tool_name == "reflow_shared_relationship_view"
+        is_seedream_update = (
+            generation_stage == "subsequent_update" and not is_seedream_reflow
+        )
+        changed_regions = [region["region_id"] for region in regions]
+        if is_seedream_initial:
+            changed_regions = ["upper_right", "lower_left"]
+        if is_seedream_update:
+            changed_regions = [self._speaker_region(current_role)]
         return ImageGenerationResult(
             wallpaper_url=wallpaper_url,
-            generation_mode=f"layered_painter_tool:{tool_name}",
-            changed_regions=[region["region_id"] for region in regions],
+            generation_mode=(
+                "seedream_single_pass:first_voice"
+                if is_seedream_initial
+                else (
+                    "seedream_single_pass:relationship_reflow"
+                    if is_seedream_reflow
+                    else "seedream_single_pass:subsequent_update"
+                )
+            ),
+            changed_regions=changed_regions,
             asset_metadata={
                 "parent_image": previous_image_url,
                 "regions": regions,
-                "masks": masks,
-                "prompt": prompt,
+                "masks": [],
+                "prompt": (
+                    raw_metadata.get("final_prompt")
+                    or raw_metadata.get("prompt")
+                    or prompt
+                ),
+                "pass_prompts": {},
                 "layered_tool": tool_name,
                 "role_references": self._reference_urls(role_reference_images),
-                "raw": result.get("raw"),
+                "generation_stage": generation_stage or "",
+                "speaker_role": current_role,
+                "raw": raw_result,
                 "quality": {
-                    "mode": "layered_tool_with_prompt_fallback",
+                    "mode": (
+                        "seedream_prompt_v2_single_pass"
+                        if is_seedream_initial
+                        else (
+                            "seedream_prompt_v2_relationship_reflow"
+                            if is_seedream_reflow
+                            else "seedream_prompt_only_regional_single_pass"
+                        )
+                    ),
                     "designer_output_only": True,
                     "painter_owns_tool_selection": True,
+                    "provider_mask_used": False,
+                    "local_composite_used": False,
                 },
             },
         )
@@ -196,15 +277,35 @@ class ImageGenerationAgent:
         self,
         previous_image_url: str | None,
         role_reference_images: dict[str, str | None] | None,
+        generation_stage: str | None = None,
+        speaker_role: str | None = None,
+        five_layer_plan: dict | None = None,
     ) -> str | None:
         refs = self._reference_urls(role_reference_images)
-        if not previous_image_url and refs.get("elder") and refs.get("child"):
-            return "base_scene_then_first_voice_compose"
-        if previous_image_url and refs.get("elder") and refs.get("child"):
-            return "first_voice_compose"
-        if previous_image_url:
-            return "update_current_side"
+        if generation_stage == "subsequent_update":
+            layout = self._relationship_layout_state(five_layer_plan or {})
+            if (
+                layout.get("spatialMode") in self.RELATIONSHIP_REFLOW_MODES
+                and previous_image_url
+                and refs.get("elder")
+                and refs.get("child")
+            ):
+                return "reflow_shared_relationship_view"
+            normalized_speaker = self._normalize_role(speaker_role)
+            return (
+                "update_current_side"
+                if previous_image_url and refs.get(normalized_speaker)
+                else None
+            )
+        if generation_stage == "first_voice":
+            if previous_image_url and refs.get("elder") and refs.get("child"):
+                return "initialize_wallpaper_view"
+            return None
         return None
+
+    @staticmethod
+    def _normalize_role(role: str | None) -> str:
+        return "child" if (role or "").lower() in {"child", "daughter", "son"} else "elder"
 
     def _current_role(self, semantic_mapping: SemanticMappingResult) -> str:
         scaffold = semantic_mapping.cognitive_scaffold or {}
@@ -213,26 +314,126 @@ class ImageGenerationAgent:
             return "child"
         return "parent"
 
-    def _layered_tool_message(self, semantic_mapping: SemanticMappingResult) -> str:
-        plan = semantic_mapping.cognitive_scaffold or {}
-        five_layers = plan.get("fiveLayerPlan") or {}
-        layer_lines = []
-        for key, layer in five_layers.items():
-            if not isinstance(layer, dict):
-                continue
-            content = layer.get("designContent")
-            if content:
-                layer_lines.append(f"{key}: {content}")
-        body = "\n".join(layer_lines)
-        if not body:
-            return semantic_mapping.semantic_visual_instruction
+    @classmethod
+    def _speaker_region(cls, role: str | None) -> str:
         return (
-            f"{semantic_mapping.semantic_visual_instruction}\n\n"
-            "五层视觉设计：\n"
-            f"{body}"
+            "upper_right"
+            if cls._normalize_role(role) == "child"
+            else "left_bottom"
         )
 
-    def _plan_regions(self, instruction: str) -> list[dict]:
+    @staticmethod
+    def _five_layer_plan(
+        semantic_mapping: SemanticMappingResult,
+    ) -> dict:
+        scaffold = semantic_mapping.cognitive_scaffold or {}
+        plan = scaffold.get("fiveLayerPlan")
+        return plan if isinstance(plan, dict) else {}
+
+    def _plan_regions(
+        self,
+        instruction: str,
+        *,
+        five_layer_plan: dict | None = None,
+        generation_stage: str | None = None,
+        speaker_role: str | None = None,
+    ) -> list[dict]:
+        layout = self._relationship_layout_state(five_layer_plan or {})
+        spatial_mode = str(layout.get("spatialMode") or "")
+        if spatial_mode in self.RELATIONSHIP_REFLOW_MODES:
+            elder_anchor = self._normalized_anchor(
+                layout.get("elderAnchor"),
+                fallback=[0.375, 0.642],
+            )
+            child_anchor = self._normalized_anchor(
+                layout.get("childAnchor"),
+                fallback=[0.57, 0.393],
+            )
+            elder_platform_anchor = self._normalized_anchor(
+                layout.get("elderPlatformAnchor"),
+                fallback=elder_anchor,
+            )
+            child_platform_anchor = self._normalized_anchor(
+                layout.get("childPlatformAnchor"),
+                fallback=child_anchor,
+            )
+            shared_scene_ratio = self._normalized_ratio(
+                layout.get("sharedSceneRatio"),
+                fallback=0.65,
+            )
+            environment_merge_ratio = self._normalized_ratio(
+                layout.get("environmentMergeRatio"),
+                fallback=0.675,
+            )
+            person_gap_ratio = self._normalized_ratio(
+                layout.get("personGapRatio"),
+                fallback=0.228,
+            )
+            platform_gap_ratio = self._normalized_ratio(
+                layout.get("platformGapRatio"),
+                fallback=0.0 if spatial_mode == "merged" else 0.25,
+            )
+            platform_overlap_ratio = self._normalized_ratio(
+                layout.get("platformOverlapRatio"),
+                fallback=0.0,
+            )
+            shared_ground_ratio = self._normalized_ratio(
+                layout.get("sharedGroundRatio"),
+                fallback=0.5,
+            )
+            padding_x = 0.16 + (0.06 * shared_scene_ratio)
+            padding_y = 0.18 + (0.05 * shared_scene_ratio)
+            shared_bbox = [
+                round(max(0.0, min(elder_anchor[0], child_anchor[0], elder_platform_anchor[0], child_platform_anchor[0]) - padding_x), 3),
+                round(max(0.04, min(elder_anchor[1], child_anchor[1], elder_platform_anchor[1], child_platform_anchor[1]) - padding_y), 3),
+                round(min(1.0, max(elder_anchor[0], child_anchor[0], elder_platform_anchor[0], child_platform_anchor[0]) + padding_x), 3),
+                round(min(0.96, max(elder_anchor[1], child_anchor[1], elder_platform_anchor[1], child_platform_anchor[1]) + padding_y), 3),
+            ]
+            return [
+                {
+                    "region_id": (
+                        "shared_relationship_space"
+                        if spatial_mode == "merged"
+                        else "relationship_layout_space"
+                    ),
+                    "semantic_axes": [
+                        "relationship_content",
+                        "character_content",
+                        "object_event_content",
+                        "environment_content",
+                    ],
+                    "bbox": shared_bbox,
+                    "strength": round(0.45 + (0.35 * environment_merge_ratio), 3),
+                    "role_anchors": {
+                        "elder": elder_anchor,
+                        "child": child_anchor,
+                    },
+                    "platform_anchors": {
+                        "elder": elder_platform_anchor,
+                        "child": child_platform_anchor,
+                    },
+                    "person_gap_ratio": person_gap_ratio,
+                    "platform_gap_ratio": platform_gap_ratio,
+                    "platform_overlap_ratio": platform_overlap_ratio,
+                    "shared_ground_ratio": shared_ground_ratio,
+                    "shared_scene_ratio": shared_scene_ratio,
+                    "environment_merge_ratio": environment_merge_ratio,
+                    "central_feature": layout.get("centralFeature") or spatial_mode,
+                    "reason": (
+                        f"关系空间为{spatial_mode}：父母、子女及两块完整生活平台同时按动态锚点重排；"
+                        "中央只能出现该档位指定的共享地面、小路、河流或距离留白。"
+                    ),
+                }
+            ]
+
+        if generation_stage == "first_voice":
+            return [
+                {"region_id": "upper_right"},
+                {"region_id": "lower_left"},
+            ]
+        if generation_stage == "subsequent_update":
+            return [{"region_id": self._speaker_region(speaker_role)}]
+
         regions = [
             {
                 "region_id": "relation_path",
@@ -242,18 +443,18 @@ class ImageGenerationAgent:
                 "reason": "中间约20%区域必须表达从左下到右上的真实空间关系路径。",
             },
             {
-                "region_id": "left_bottom_current_actor",
+                "region_id": "left_bottom_elder",
                 "semantic_axes": ["character_content", "object_event_content"],
                 "bbox": [0.04, 0.58, 0.42, 0.96],
                 "strength": 0.32,
-                "reason": "左下约30%固定为当前端人物和本次事件锚点，人物占左下区域内部空间的1/2到2/3。",
+                "reason": "左下约30%固定为父母人物及其生活区域，人物占左下区域内部空间的1/2到2/3。",
             },
             {
-                "region_id": "upper_right_other_side",
+                "region_id": "upper_right_child",
                 "semantic_axes": ["character_content", "relationship_content"],
-                "bbox": [0.26, 0.03, 0.98, 0.56],
+                "bbox": [0.22, 0.03, 0.92, 0.56],
                 "strength": 0.45,
-                "reason": "右上约50%固定为另一方人物或生活空间，是最大生活空间，人物占该区域内部空间的1/2到2/3。",
+                "reason": "右上偏内侧约50%固定为子女人物及其生活区域，是最大生活空间；人物整体向左收，完整轮廓与右边框至少保留8%画布宽度的环境留白。",
             }
         ]
         if any(word in instruction for word in ("工作", "生病", "做饭", "散步", "物件", "痕迹")):
@@ -278,17 +479,36 @@ class ImageGenerationAgent:
             )
         return regions
 
-    def _plan_masks(self, regions: list[dict]) -> list[dict]:
-        return [
-            {
-                "region_id": region["region_id"],
-                "mask_type": "normalized_bbox",
-                "bbox": region["bbox"],
-                "blur": 12,
-                "dilate": 24,
-            }
-            for region in regions
-        ]
+    @staticmethod
+    def _relationship_layout_state(five_layer_plan: dict) -> dict:
+        l2 = five_layer_plan.get("L2_relational_structure_layer")
+        if not isinstance(l2, dict):
+            return {}
+        if isinstance(l2.get("layoutState"), dict):
+            return l2["layoutState"]
+        controls = l2.get("deterministicControls")
+        if isinstance(controls, dict) and isinstance(controls.get("layoutState"), dict):
+            return controls["layoutState"]
+        return {}
+
+    @staticmethod
+    def _normalized_anchor(value, *, fallback: list[float]) -> list[float]:
+        if not isinstance(value, list) or len(value) != 2:
+            return fallback
+        try:
+            return [
+                round(max(0.0, min(1.0, float(value[0]))), 3),
+                round(max(0.0, min(1.0, float(value[1]))), 3),
+            ]
+        except (TypeError, ValueError):
+            return fallback
+
+    @staticmethod
+    def _normalized_ratio(value, *, fallback: float) -> float:
+        try:
+            return round(max(0.0, min(1.0, float(value))), 3)
+        except (TypeError, ValueError):
+            return fallback
 
     def _build_prompt(
         self,
@@ -320,9 +540,9 @@ class ImageGenerationAgent:
 
 固定产品构图：
 - 严格三段式绝对比例：右上区域约占画面50%，中间关系路径约占画面20%，左下区域约占画面30%。
-- 右上角是另一方人物、生活空间或半透明想象场景，是最大生活空间。
+- 右上角固定为子女人物、生活空间或半透明想象场景，是最大生活空间。
 - 右上人物占右上区域内部空间的1/2到2/3，脸部和表情清晰，同时保留充足的房间、窗、桌面、植物、天空或生活环境。
-- 左下角是当前端人物和本次事件现场，左下人物占左下区域内部空间的1/2到2/3，脸部和情绪仍然可读，同时保留事件物件和生活环境。
+- 左下角固定为父母人物及其生活区域，左下人物占左下区域内部空间的1/2到2/3，脸部和情绪仍然可读，同时保留事件物件和生活环境。
 - 人物相对尺度硬约束：最终画面里左下人物的可见头身高度和脸部面积约为右上人物的1/2，不要因为左下是前景就把左下人物画得比右上人物更大。
 - 中间是从左下到右上的关系映射路径，主连接是可读的空间路径或结构路径，例如小路、桥、走廊、河岸、庭院路径、窗与窗之间的视线或生活空间边界。
 - 双方人物姿态轻松，分别处在各自生活动作中；不要正脸直视镜头，视线应自然看向画面内事件、物件、路径、窗外、天空、远处、手中的东西或画面外侧。
@@ -381,9 +601,9 @@ class ImageGenerationAgent:
             "- 人物应自然融入当前场景和光照，保持同一画风，避免照片拼贴感或半写实 AI 肖像感。",
         ]
         if refs.get("elder"):
-            lines.append("- elder 参考图对应老人/父母一方；老人端时放在左下角，子女端时放在右上角。")
+            lines.append("- elder 参考图对应老人/父母一方，始终放在左下角。")
         if refs.get("child"):
-            lines.append("- child 参考图对应子女/年轻一方；老人端时放在右上角，子女端时放在左下角。")
+            lines.append("- child 参考图对应子女/年轻一方，放在右上偏内侧；人物整体向左收，完整轮廓距右边框至少保留8%画布宽度的环境留白。")
         lines.append("- 如果参考人物和文本场景的服装不一致，可适度改成场景适配的衣着，但保留可识别的面部身份特征。")
         return "\n".join(lines)
 

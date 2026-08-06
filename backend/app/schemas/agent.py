@@ -30,6 +30,13 @@ class LanguageEmotionResult(_CamelModel):
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
+class ChatBotResult(_CamelModel):
+    transcript: str
+    voice_affect: dict[str, Any] = Field(default_factory=dict)
+    reply: str
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
 class MemoryRelationResult(_CamelModel):
     longitudinal: dict[str, Any]
     relational: dict[str, Any]
@@ -49,9 +56,15 @@ class SemanticMappingResult(_CamelModel):
 
 class ImageGenerationResult(_CamelModel):
     wallpaper_url: str = ""
-    generation_mode: str = "mask_image2image_mvp"
+    generation_mode: str = "single_prompt_image_mvp"
     changed_regions: list[str] = Field(default_factory=list)
     asset_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WallpaperViewsResult(_CamelModel):
+    child_view_url: str = ""
+    elder_view_url: str = ""
+    speaker_role: str = ""
 
 
 class ComfortReplyResult(_CamelModel):
@@ -100,10 +113,12 @@ class AgentRunResult(_CamelModel):
     user_id: Optional[str] = None
     relationship_id: Optional[str] = None
     steps: list[AgentStep]
+    chat_bot: Optional[ChatBotResult] = None
     language_emotion: Optional[LanguageEmotionResult] = None
     memory_relation: Optional[MemoryRelationResult] = None
     semantic_mapping: Optional[SemanticMappingResult] = None
     image_generation: Optional[ImageGenerationResult] = None
+    wallpaper_views: Optional[WallpaperViewsResult] = None
     created_at: datetime
     updated_at: datetime
 
@@ -112,6 +127,9 @@ class AgentRunCreateOut(_CamelModel):
     run_id: str
     status: str
     result: AgentRunResult
+    request_id: str = ""
+    event_id: str = ""
+    event_seq: int = 0
 
 
 class AgentRunTextIn(_CamelModel):
@@ -169,3 +187,10 @@ class CharacterAssetOut(_CamelModel):
 
 class CharacterAssetListOut(_CamelModel):
     items: list[CharacterAssetOut] = Field(default_factory=list)
+
+
+class RelationshipCharacterAssetsOut(_CamelModel):
+    relationship_id: str
+    ready: bool = False
+    elder: Optional[CharacterAssetOut] = None
+    child: Optional[CharacterAssetOut] = None

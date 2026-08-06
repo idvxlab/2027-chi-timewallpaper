@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import uuid
 from pathlib import Path
@@ -28,6 +29,26 @@ async def transcribe_chatbox_audio(
 
     if not audio:
         raise HTTPException(status_code=400, detail="audio is empty")
+
+    if _use_doubao_seed_asr(endpoint, model):
+        api_key = settings.doubao_asr_api_key.strip()
+        if not api_key:
+            idx = len(audio) % len(MOCK_TRANSCRIPTS)
+            return {
+                "transcript": MOCK_TRANSCRIPTS[idx],
+                "raw": {
+                    "provider": "mock_chatbox_asr",
+                    "reason": "DOUBAO_ASR_API_KEY is not configured",
+                    "size": len(audio),
+                },
+            }
+        return await _transcribe_with_doubao_seed_asr(
+            audio=audio,
+            endpoint=endpoint,
+            api_key=api_key,
+            resource_id=settings.doubao_asr_resource_id.strip(),
+            run_id=run_id,
+        )
 
     if not api_key or not api_base_url:
         idx = len(audio) % len(MOCK_TRANSCRIPTS)
@@ -58,6 +79,92 @@ async def transcribe_chatbox_audio(
         model=model,
         run_id=run_id,
     )
+
+
+def _use_doubao_seed_asr(endpoint: str, model: str) -> bool:
+    text = f"{endpoint} {model}".lower()
+    return "doubao-seed-asr" in text or "seed-asr-2" in text or "recognize/flash" in text
+
+
+async def _transcribe_with_doubao_seed_asr(
+    *,
+    audio: bytes,
+    endpoint: str,
+    api_key: str,
+    resource_id: str,
+    run_id: str | None,
+) -> dict[str, Any]:
+    endpoint = endpoint or "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"
+    request_id = str(uuid.uuid4())
+    payload = {
+        "user": {"uid": run_id or request_id},
+        "audio": {"data": base64.b64encode(audio).decode("ascii")},
+        "request": {
+            "model_name": "bigmodel",
+            "enable_itn": True,
+            "enable_punc": True,
+        },
+    }
+    headers = {
+        "X-Api-Key": api_key,
+        "X-Api-Resource-Id": resource_id or "volc.bigasr.auc_turbo",
+        "X-Api-Request-Id": request_id,
+        "X-Api-Sequence": "-1",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        _log(run_id, f"Doubao Seed ASR 2.0 request endpoint={endpoint} requestId={request_id}")
+        async with httpx.AsyncClient(timeout=45) as client:
+            response = await client.post(endpoint, json=payload, headers=headers)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Doubao Seed ASR 2.0 HTTP {exc.response.status_code}: {exc.response.text[:800]}",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Doubao Seed ASR 2.0 request failed ({type(exc).__name__}): {repr(exc)}",
+        ) from exc
+
+    provider_code = response.headers.get("X-Api-Status-Code", "")
+    provider_message = response.headers.get("X-Api-Message", "")
+    log_id = response.headers.get("X-Tt-Logid", "")
+    if provider_code and provider_code != "20000000":
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Doubao Seed ASR 2.0 failed code={provider_code} "
+                f"message={provider_message} logId={log_id}"
+            ),
+        )
+
+    try:
+        data = response.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Doubao Seed ASR 2.0 returned non-JSON response: {response.text[:300]}",
+        ) from exc
+
+    transcript = _response_text(data)
+    if not transcript:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Doubao Seed ASR 2.0 response did not contain text: {json.dumps(data, ensure_ascii=False)[:800]}",
+        )
+    _log(run_id, f"Doubao Seed ASR 2.0 response code={provider_code or 'HTTP-200'} logId={log_id}")
+    return {
+        "transcript": transcript,
+        "raw": {
+            "provider": "doubao_seed_asr_2_0",
+            "requestId": request_id,
+            "logId": log_id,
+            "response": data,
+        },
+    }
 
 
 def _use_doubao_chat_audio(endpoint: str, model: str) -> bool:
