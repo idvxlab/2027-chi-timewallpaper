@@ -1,17 +1,87 @@
+"use client";
+
+import { useEffect, useState } from "react";
 import { IpadFrame } from "@/components/shared/IpadFrame";
 import { WallpaperStage } from "@/components/wallpaper/WallpaperStage";
-import { ChatOverlay } from "@/components/wallpaper/ChatOverlay";
-import { DemoSwitcher } from "@/components/wallpaper/DemoSwitcher";
+import { OnboardingFlow } from "@/components/onboarding/OnboardingFlow";
+import { useOnboardingStore } from "@/lib/hooks/useOnboardingStore";
+import { useSceneStore } from "@/lib/hooks/useSceneStore";
+import {
+  getCurrentSession,
+  normalizeWallpaperImageUrl,
+} from "@/lib/api";
 
 export default function Page() {
+  const step = useOnboardingStore((s) => s.step);
+  const [isRestoring, setIsRestoring] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    getCurrentSession()
+      .then((session) => {
+        if (!active) return;
+        const onboarding = useOnboardingStore.getState();
+        if (!session) {
+          // A dev-server restart can preserve stale Zustand state while the
+          // backend session cookie is gone. Return to onboarding instead of
+          // mounting authenticated WebSockets with no valid session.
+          onboarding.resetOnboarding();
+          return;
+        }
+        onboarding.setRole(session.viewerRole);
+        onboarding.setName(session.displayName);
+        onboarding.setGender(session.gender);
+        onboarding.setUserContext({
+          userId: session.userId,
+          counterpartUserId: session.counterpartUserId,
+          relationshipId: session.relationshipId,
+          relationshipDisplayName: session.relationshipDisplayName,
+          inviteCode: session.inviteCode,
+          relationshipStatus: session.relationshipStatus,
+          viewerRole: session.viewerRole,
+          counterpartRole: session.counterpartRole,
+          familyRole: session.familyRole,
+        });
+        // Migrate old demo/base-scene URLs saved in existing sessions.
+        const restoredWallpaperUrl = normalizeWallpaperImageUrl(
+          session.wallpaperUrl,
+        );
+
+        if (restoredWallpaperUrl) {
+          useSceneStore.getState().setGeneratedWallpaperUrl(restoredWallpaperUrl);
+        }
+        // Do NOT set initialInsertStatus here — useWallpaperSync will query
+        // the backend stage and set it to idle or ready accordingly.
+        onboarding.setStep(session.onboardingStep);
+      })
+      .catch((error) => {
+        console.error("[SessionRestore] failed", error);
+      })
+      .finally(() => {
+        if (active) setIsRestoring(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // WallpaperStage already composes <AtmosphereLayer /> and
+  // <ChatOverlay /> internally, so we deliberately do NOT mount
+  // ChatOverlay here — doing so would render the overlay twice and
+  // double every interaction handler.
   return (
-    <main className="min-h-screen flex flex-col items-center justify-center gap-6 p-6 bg-slate-100">
+    <main className="min-h-screen flex items-center justify-center p-6 bg-slate-100">
       <IpadFrame>
-        <WallpaperStage />
-        {/* Chat overlay on top of wallpaper — renders in both wallpaper & white mode */}
-        <ChatOverlay />
+        {isRestoring ? (
+          <div className="flex h-full items-center justify-center bg-white text-sm text-slate-500">
+            Loading...
+          </div>
+        ) : step !== "wallpaper" ? (
+          <OnboardingFlow />
+        ) : (
+          <WallpaperStage />
+        )}
       </IpadFrame>
-      <DemoSwitcher />
     </main>
   );
 }

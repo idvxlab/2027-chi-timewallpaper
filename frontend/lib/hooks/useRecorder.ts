@@ -1,11 +1,10 @@
 "use client";
 
 import { useRef, useState } from "react";
-import { uploadAudio } from "@/lib/api";
 import { useSceneStore } from "./useSceneStore";
+import { uploadAudio } from "@/lib/api";
 
 export type RecorderStatus = "idle" | "recording" | "stopping";
-
 
 export function useRecorder() {
   const [status, setStatusState] = useState<RecorderStatus>("idle");
@@ -22,8 +21,12 @@ export function useRecorder() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const addMessage = useSceneStore((s) => s.addMessage);
-  const setToast = useSceneStore((s) => s.setToast);
-  const setGeneratedWallpaperUrl = useSceneStore((s) => s.setGeneratedWallpaperUrl);
+  const setGeneratedWallpaperUrl = useSceneStore(
+    (s) => s.setGeneratedWallpaperUrl,
+  );
+
+  const onErrorRef = useRef<((msg: string) => void) | null>(null);
+  const onStatusRef = useRef<((msg: string) => void) | null>(null);
 
   function setStatus(next: RecorderStatus) {
     statusRef.current = next;
@@ -54,33 +57,34 @@ export function useRecorder() {
     cleanup();
 
     if (durationMs < 800 || wavBlob.size < 4000) {
-      setToast("录音太短，再试一次");
+      onErrorRef.current?.("录音太短，再试一次");
       setStatus("idle");
       setElapsedMs(0);
       return;
     }
 
     try {
-      setToast("正在识别语音并生成壁纸…");
-      const result = await uploadAudio(wavBlob);
-      const transcript = result.transcript || "语音已收到";
+      onStatusRef.current?.("正在识别语音并生成壁纸…");
+      const { transcript, imageUrl } = await uploadAudio(wavBlob);
 
       addMessage({
         type: "voice_message",
         from: fromRef.current,
         audioUrl,
-        text: transcript,
+        text: transcript || "(没有识别到内容)",
         durationSec,
       });
 
-      if (result.imageUrl) {
-        setGeneratedWallpaperUrl(result.imageUrl);
-        setToast("新壁纸已生成");
+      if (imageUrl) {
+        setGeneratedWallpaperUrl(imageUrl);
+        onStatusRef.current?.("新壁纸已生成");
       } else {
-        setToast("语音已识别，当前使用默认壁纸");
+        onStatusRef.current?.("语音已识别，当前使用默认壁纸");
       }
     } catch (error) {
-      setToast(error instanceof Error ? error.message : "语音处理失败");
+      onErrorRef.current?.(
+        error instanceof Error ? error.message : "语音处理失败",
+      );
     } finally {
       setStatus("idle");
       setElapsedMs(0);
@@ -90,9 +94,10 @@ export function useRecorder() {
   async function start(from: "child" | "elder") {
     if (statusRef.current !== "idle") return;
 
-    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    const AudioContextClass =
+      window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!navigator.mediaDevices?.getUserMedia || !AudioContextClass) {
-      setToast("当前浏览器不支持录音");
+      onErrorRef.current?.("当前浏览器不支持录音");
       return;
     }
 
@@ -106,7 +111,7 @@ export function useRecorder() {
         },
       });
     } catch {
-      setToast("请允许麦克风权限");
+      onErrorRef.current?.("请允许麦克风权限");
       return;
     }
 
@@ -137,12 +142,10 @@ export function useRecorder() {
     startedAtRef.current = Date.now();
     setStatus("recording");
     setElapsedMs(0);
-    setToast(null);
 
     timerRef.current = setInterval(() => {
       setElapsedMs(Date.now() - startedAtRef.current);
     }, 100);
-
   }
 
   function stop() {
@@ -161,9 +164,14 @@ export function useRecorder() {
     }
   }
 
+  function bindStatus(onStatus: (msg: string) => void, onError: (msg: string) => void) {
+    onStatusRef.current = onStatus;
+    onErrorRef.current = onError;
+  }
+
   const elapsedSec = Math.round(elapsedMs / 1000);
 
-  return { status, start, stop, toggle, elapsedSec };
+  return { status, start, stop, toggle, elapsedSec, bindStatus };
 }
 
 function encodeWav(chunks: Float32Array[], length: number, sampleRate: number): Blob {

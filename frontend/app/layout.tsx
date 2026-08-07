@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { AppPreferencesHydrator } from "@/components/shared/AppPreferencesHydrator";
 
 export const metadata: Metadata = {
   title: "Time Wallpaper",
@@ -12,8 +13,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="zh-CN">
-      <body>{children}</body>
+    <html lang="en">
+      <body>
+        <AppPreferencesHydrator />
+        {children}
+      </body>
     </html>
   );
 }

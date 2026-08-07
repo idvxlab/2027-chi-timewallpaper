@@ -1,8 +1,12 @@
 "use client";
 
 import { create } from "zustand";
-import { startAmbient, stopAmbient } from "@/lib/audio";
-import type { Scene, SceneEvent } from "@/lib/types/scene";
+
+// Imported here because the WallpaperStage system is the only consumer
+// of these types; keeping them adjacent to the scene store avoids
+// leaking them into the onboarding or pipeline surfaces.
+import type { WallpaperEnvelope } from "@/lib/wallpaperEnv";
+import type { RelationshipSummary } from "@/lib/api";
 
 export type VoiceMessage = {
   id: string;
@@ -12,6 +16,9 @@ export type VoiceMessage = {
   text: string;
   durationSec: number;
   timestamp: number;
+  suggestedReply?: string;
+  suggestedReplies?: string[];
+  relationshipSummary?: RelationshipSummary;
 };
 
 export type TextMessage = {
@@ -20,10 +27,15 @@ export type TextMessage = {
   from: "child" | "elder";
   text: string;
   timestamp: number;
+  suggestedReply?: string;
+  suggestedReplies?: string[];
+  relationshipSummary?: RelationshipSummary;
 };
 
 export type Message = VoiceMessage | TextMessage;
-export type NewMessage = Omit<VoiceMessage, "id" | "timestamp"> | Omit<TextMessage, "id" | "timestamp">;
+export type NewMessage =
+  | Omit<VoiceMessage, "id" | "timestamp">
+  | Omit<TextMessage, "id" | "timestamp">;
 
 export type MessagesByDay = {
   前天: Message[];
@@ -31,10 +43,56 @@ export type MessagesByDay = {
   今天: Message[];
 };
 
+export type DayLabel = keyof MessagesByDay;
+
+export type WallpaperItem = {
+  revisionId: string;
+  eventSeq: number;
+  imageUrl: string;
+  createdAt: string;
+  transcript?: string;
+  reply?: string;
+  suggestedReplies?: string[];
+  relationshipSummary?: RelationshipSummary;
+  speakerRole?: "child" | "elder" | null;
+  isDemo?: boolean;
+};
+
+export type WallpaperInteractionItem = {
+  eventId: string;
+  eventSeq: number;
+  status: string;
+  transcript: string;
+  reply: string;
+  suggestedReplies?: string[];
+  relationshipSummary?: RelationshipSummary;
+  speakerRole: "child" | "elder";
+  createdAt: string;
+};
+
+export type WallpapersByDay = Record<DayLabel, WallpaperItem[]>;
+
 export type UiMode = "wallpaper" | "white";
 
-const DAY_LABELS: (keyof MessagesByDay)[] = ["前天", "昨天", "今天"];
-const STORAGE_KEY = "scene_chat_history";
+// "Perceptual attention shift system": which subject the user's gaze
+// is centered on inside the shared memory scene. "balanced" is the
+// default relaxed state — neither subject is privileged. "elder" and
+// "child" bias the framing toward one of the two figures.
+export type FocusMode = "balanced" | "elder" | "child";
+
+export const DAY_LABELS: DayLabel[] = ["前天", "昨天", "今天"];
+const STORAGE_KEY = "wallpaper_chat_history";
+
+/** Returns a "M/D" string for a given day index.
+ *  0 = day-before  → today - 2
+ *  1 = yesterday  → today - 1
+ *  2 = today      → today */
+export function formatDayLabel(dayIndex: number): string {
+  const today = new Date();
+  const target = new Date(today);
+  target.setDate(today.getDate() - (2 - dayIndex));
+  return `${target.getMonth() + 1}/${target.getDate()}`;
+}
 
 function uid() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -44,29 +102,23 @@ function blank(): MessagesByDay {
   return { 前天: [], 昨天: [], 今天: [] };
 }
 
-function mockData(): MessagesByDay {
-  const now = Date.now();
-  return {
-    前天: [
-      { id: uid(), type: "text_message", from: "child", text: "奶奶，昨天晚上梦到你了，梦见我们一起去公园玩。", timestamp: now - 3600000 * 28 },
-      { id: uid(), type: "text_message", from: "elder", text: "宝贝，梦里的公园是不是很漂亮呀？奶奶也想你。", timestamp: now - 3600000 * 27 },
-      { id: uid(), type: "text_message", from: "child", text: "是的！奶奶你要注意身体，天冷了要多穿衣服。", timestamp: now - 3600000 * 26 },
-    ],
-    昨天: [
-      { id: uid(), type: "text_message", from: "child", text: "奶奶，今天妈妈做了红烧肉，特别香！我给你留了一块。", timestamp: now - 3600000 * 20 },
-      { id: uid(), type: "text_message", from: "elder", text: "哎呀，我家宝贝真乖，记得给奶奶留好吃的。", timestamp: now - 3600000 * 19 },
-      { id: uid(), type: "text_message", from: "child", text: "下周我就回去看奶奶啦，带你吃大餐！", timestamp: now - 3600000 * 18 },
-      { id: uid(), type: "text_message", from: "elder", text: "太好了，奶奶每天都在数着日子等你回来。", timestamp: now - 3600000 * 17 },
-    ],
-    今天: [
-      { id: uid(), type: "text_message", from: "child", text: "奶奶，今天天气真好呀，你那边怎么样？", timestamp: now - 3600000 * 3 },
-      { id: uid(), type: "text_message", from: "elder", text: "宝贝乖，奶奶这边也挺好的，就是有点想你。", timestamp: now - 3600000 * 2.5 },
-      { id: uid(), type: "text_message", from: "child", text: "我下周就回来看你啦！给你带好吃的。", timestamp: now - 3600000 * 2 },
-      { id: uid(), type: "text_message", from: "elder", text: "太好了，奶奶等着你，记得多穿点衣服。", timestamp: now - 3600000 * 1.5 },
-      { id: uid(), type: "text_message", from: "child", text: "知道啦奶奶，那我先去上课了，晚上再给你打电话。", timestamp: now - 3600000 },
-      { id: uid(), type: "text_message", from: "elder", text: "好，去吧，好好学习，奶奶爱你。", timestamp: now - 3600000 * 0.5 },
-    ],
-  };
+function blankWallpapers(): WallpapersByDay {
+  return { 前天: [], 昨天: [], 今天: [] };
+}
+
+function dayLabelFor(createdAt: string): DayLabel | null {
+  const created = new Date(createdAt);
+  if (Number.isNaN(created.getTime())) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  created.setHours(0, 0, 0, 0);
+  const difference = Math.round(
+    (today.getTime() - created.getTime()) / (24 * 60 * 60 * 1000),
+  );
+  if (difference === 0) return "今天";
+  if (difference === 1) return "昨天";
+  if (difference === 2) return "前天";
+  return null;
 }
 
 function loadMessages(): MessagesByDay {
@@ -77,7 +129,7 @@ function loadMessages(): MessagesByDay {
   } catch {
     /* ignore */
   }
-  return mockData();
+  return blank();
 }
 
 function persist(msgs: MessagesByDay) {
@@ -88,77 +140,446 @@ function persist(msgs: MessagesByDay) {
   }
 }
 
+export type InitialInsertStatus = "idle" | "generating" | "ready" | "failed";
+
 type State = {
-  _ambientSrc: string | null;
-  _toastTimer: ReturnType<typeof setTimeout> | null;
-
-  scene: Scene | null;
-  setScene: (s: Scene) => void;
-  applyEvent: (ev: SceneEvent) => void;
-
-  toast: string | null;
-  setToast: (msg: string | null) => void;
-
   uiMode: UiMode;
   toggleUiMode: () => void;
 
   currentDayIndex: number;
+  setCurrentDayIndex: (index: number) => void;
+  currentWallpaperIndex: number;
+  wallpapersByDay: WallpapersByDay;
+  setWallpaperRevisions: (items: WallpaperItem[]) => void;
+  setWallpaperInteractions: (items: WallpaperInteractionItem[]) => void;
+  shiftWallpaper: (dir: -1 | 1) => void;
   messagesByDay: MessagesByDay;
-  shiftDay: (dir: -1 | 1) => void;
 
   generatedWallpaperUrl: string;
   setGeneratedWallpaperUrl: (url: string) => void;
+  wallpaperVersion: number;
+  setWallpaperVersion: (version: number) => void;
+
+  // Tracks whether the initial two-pass character insert (PreludeStep) has
+  // completed. self-edit is only allowed when this is "ready".
+  initialInsertStatus: InitialInsertStatus;
+  setInitialInsertStatus: (s: InitialInsertStatus) => void;
+
+  // True once the backend stage has been confirmed at least once for the
+  // current session. While false, the interaction mode is "loading" so the
+  // central button cannot flash on a refresh of a fully-completed wallpaper.
+  wallpaperStateHydrated: boolean;
+  setWallpaperStateHydrated: (v: boolean) => void;
+
+  // Session ID: incremented when entering a new wallpaper flow so that
+  // stale API responses from a previous flow can be detected and discarded.
+  generationSessionId: string;
+  incrementGenerationSession: () => string;
+
+  wallpaperEnvelope: WallpaperEnvelope;
+  setWallpaperEnvelope: (env: WallpaperEnvelope) => void;
+
+  focusMode: FocusMode;
+  setFocusMode: (mode: FocusMode) => void;
 
   addMessage: (msg: NewMessage) => void;
   clearMessages: () => void;
 };
 
+type WallpaperSelectionState = Pick<
+  State,
+  "currentDayIndex" | "currentWallpaperIndex" | "wallpapersByDay"
+>;
+
+export function getSelectedWallpaper(
+  state: WallpaperSelectionState,
+): WallpaperItem | undefined {
+  const label = DAY_LABELS[state.currentDayIndex];
+  return state.wallpapersByDay[label]?.[state.currentWallpaperIndex];
+}
+
+export function isLatestWallpaper(state: WallpaperSelectionState): boolean {
+  return (
+    state.currentDayIndex === 2 &&
+    state.currentWallpaperIndex === state.wallpapersByDay.今天.length - 1
+  );
+}
+
+export function isFirstWallpaper(state: WallpaperSelectionState): boolean {
+  return state.currentDayIndex === 0 && state.currentWallpaperIndex === 0;
+}
+
+/**
+ * Determines the current wallpaper interaction mode.
+ *
+ *   loading          — backend stage has not yet been resolved for the
+ *                      current session. No button is shown; SubjectLift is
+ *                      disabled; previous wallpaper image is preserved.
+ *   history_disabled — user is viewing a past day or an older revision of
+ *                      today. Neither entry is active. Left/right history
+ *                      navigation continues to work normally.
+ *   initial_voice    — base wallpaper, first voice not yet done.
+ *                      Central microphone button is shown. SubjectLift is
+ *                      disabled.
+ *   processing       — first voice recording/transcribing/editing in
+ *                      progress (initialInsertStatus === "generating").
+ *                      Central button shows loading state. SubjectLift is
+ *                      disabled.
+ *   subject_lift     — first voice complete, full shared wallpaper shown.
+ *                      Central button is NOT rendered. SubjectLift is active.
+ */
+export type InteractionMode =
+  | "loading"
+  | "history_disabled"
+  | "initial_voice"
+  | "processing"
+  | "subject_lift";
+
+export type WallpaperInteractionState = Pick<
+  State,
+  | "initialInsertStatus"
+  | "currentDayIndex"
+  | "currentWallpaperIndex"
+  | "wallpapersByDay"
+  | "wallpaperStateHydrated"
+>;
+
+export function getWallpaperInteractionMode(
+  state: WallpaperInteractionState,
+): InteractionMode {
+  // Backend stage not yet resolved — keep current display, no entry active.
+  if (!state.wallpaperStateHydrated) {
+    return "loading";
+  }
+
+  // Past day or older revision — neither entry is active.
+  if (!isLatestWallpaper(state)) {
+    return "history_disabled";
+  }
+
+  // Latest, but first voice still pending.
+  if (
+    state.initialInsertStatus === "idle" ||
+    state.initialInsertStatus === "failed"
+  ) {
+    return "initial_voice";
+  }
+
+  // First voice recording/transcribing/editing in progress.
+  if (state.initialInsertStatus === "generating") {
+    return "processing";
+  }
+
+  // First voice done — full shared wallpaper.
+  return "subject_lift";
+}
+
 export const useSceneStore = create<State>((set, get) => ({
-  _ambientSrc: null,
-  _toastTimer: null,
-
-  scene: null,
-
-  setScene(scene: Scene) {
-    const prev = get()._ambientSrc;
-    const next = scene.ambient ?? null;
-    if (next && next !== prev) startAmbient(next);
-    else if (!next && prev) stopAmbient(prev);
-    set({ scene, _ambientSrc: next });
-  },
-
-  applyEvent(ev: SceneEvent) {
-    const s = get();
-    if (ev.scene) s.setScene(ev.scene);
-    if (ev.toast) s.setToast(ev.toast);
-  },
-
-  toast: null,
-
-  setToast(msg: string | null) {
-    const prev = get()._toastTimer;
-    if (prev) clearTimeout(prev);
-    const id = msg ? setTimeout(() => set({ toast: null }), 3500) : null;
-    set({ toast: msg, _toastTimer: id });
-  },
-
   uiMode: "wallpaper",
   toggleUiMode() {
     set((s) => ({ uiMode: s.uiMode === "wallpaper" ? "white" : "wallpaper" }));
   },
 
   currentDayIndex: 2,
+  currentWallpaperIndex: 0,
+  wallpapersByDay: blankWallpapers(),
+  setCurrentDayIndex(index: number) {
+    if (index >= 0 && index <= 2) {
+      const label = DAY_LABELS[index];
+      set({
+        currentDayIndex: index,
+        currentWallpaperIndex: Math.max(
+          0,
+          get().wallpapersByDay[label].length - 1,
+        ),
+        focusMode: "balanced",
+      });
+    }
+  },
   messagesByDay: loadMessages(),
 
-  shiftDay(dir: -1 | 1) {
-    const next = get().currentDayIndex + dir;
-    if (next < 0 || next > 2) return;
-    set({ currentDayIndex: next });
+  setWallpaperRevisions(items) {
+    const previous = get();
+
+    // Defense-in-depth: the legacy frontend used to seed the store with
+    // /wallpaper/today-bg.jpg as a demo placeholder. The 2027 backend
+    // never produces that URL, but we keep filtering it so a stray row
+    // in a migrated DB can never resurrect the deleted static asset.
+    const LEGACY_DEMO_WALLPAPER = "/wallpaper/today-bg.jpg";
+    const filteredItems = items.filter(
+      (item) => item.imageUrl !== LEGACY_DEMO_WALLPAPER,
+    );
+
+    // A wallpaper revision is also the authoritative record of the voice event
+    // that produced it. Sync that transcript so the partner device does not keep
+    // generating suggestions from stale, device-local chat history.
+    const syncedMessages: MessagesByDay = {
+      前天: [...previous.messagesByDay.前天],
+      昨天: [...previous.messagesByDay.昨天],
+      今天: [...previous.messagesByDay.今天],
+    };
+    for (const item of filteredItems) {
+      const transcript = item.transcript?.trim();
+      const speakerRole = item.speakerRole;
+      const label = dayLabelFor(item.createdAt);
+      if (!transcript || !speakerRole || !label) continue;
+
+      const timestamp = Date.parse(item.createdAt) || Date.now();
+      const messageId = `wallpaper-event-${item.eventSeq}`;
+      const messages = syncedMessages[label];
+      const exactIndex = messages.findIndex((message) => message.id === messageId);
+      const duplicateIndex = messages.findIndex(
+        (message) =>
+          message.from === speakerRole &&
+          message.text.trim() === transcript &&
+          Math.abs(message.timestamp - timestamp) < 10 * 60 * 1000,
+      );
+      const targetIndex = exactIndex >= 0 ? exactIndex : duplicateIndex;
+
+      if (targetIndex >= 0) {
+        messages[targetIndex] = {
+          ...messages[targetIndex],
+          id: messageId,
+          from: speakerRole,
+          text: transcript,
+          timestamp,
+          suggestedReply:
+            item.reply?.trim() || messages[targetIndex].suggestedReply,
+          suggestedReplies:
+            item.suggestedReplies?.filter(Boolean).slice(0, 2) ||
+            messages[targetIndex].suggestedReplies,
+          relationshipSummary:
+            item.relationshipSummary || messages[targetIndex].relationshipSummary,
+        };
+      } else {
+        messages.push({
+          id: messageId,
+          type: "voice_message",
+          from: speakerRole,
+          audioUrl: "",
+          text: transcript,
+          durationSec: 0,
+          timestamp,
+          suggestedReply: item.reply?.trim() || undefined,
+          suggestedReplies: item.suggestedReplies?.filter(Boolean).slice(0, 2),
+          relationshipSummary: item.relationshipSummary,
+        });
+      }
+      messages.sort((left, right) => left.timestamp - right.timestamp);
+    }
+    persist(syncedMessages);
+
+    const selectedRevisionId = getSelectedWallpaper(previous)?.revisionId;
+    const wasLatest = isLatestWallpaper(previous);
+    const realItems: WallpapersByDay = { 前天: [], 昨天: [], 今天: [] };
+
+    for (const item of [...filteredItems].sort((a, b) => a.eventSeq - b.eventSeq)) {
+      const label = dayLabelFor(item.createdAt);
+      if (
+        label &&
+        !realItems[label].some((entry) => entry.revisionId === item.revisionId)
+      ) {
+        realItems[label].push(item);
+      }
+    }
+
+    // Build grouped: start with existing wallpapers and merge real items in
+    const grouped: WallpapersByDay = {
+      前天: realItems.前天.length > 0 ? realItems.前天 : previous.wallpapersByDay.前天,
+      昨天: realItems.昨天.length > 0 ? realItems.昨天 : previous.wallpapersByDay.昨天,
+      今天: realItems.今天.length > 0 ? realItems.今天 : previous.wallpapersByDay.今天,
+    };
+
+    let nextDayIndex = previous.currentDayIndex;
+    let nextWallpaperIndex = previous.currentWallpaperIndex;
+    if (wasLatest) {
+      nextDayIndex = 2;
+      nextWallpaperIndex = grouped.今天.length - 1;
+    } else if (selectedRevisionId) {
+      for (let dayIndex = 0; dayIndex < DAY_LABELS.length; dayIndex += 1) {
+        const foundIndex = grouped[DAY_LABELS[dayIndex]].findIndex(
+          (entry) => entry.revisionId === selectedRevisionId,
+        );
+        if (foundIndex >= 0) {
+          nextDayIndex = dayIndex;
+          nextWallpaperIndex = foundIndex;
+          break;
+        }
+      }
+    }
+    nextWallpaperIndex = Math.min(
+      nextWallpaperIndex,
+      grouped[DAY_LABELS[nextDayIndex]].length - 1,
+    );
+
+    const latestRevision = filteredItems[filteredItems.length - 1];
+    const isValidRevisionUrl =
+      latestRevision?.imageUrl &&
+      latestRevision.imageUrl !== LEGACY_DEMO_WALLPAPER;
+    const nextGeneratedUrl = isValidRevisionUrl
+      ? latestRevision.imageUrl
+      : previous.generatedWallpaperUrl;
+    set({
+      wallpapersByDay: grouped,
+      messagesByDay: syncedMessages,
+      currentDayIndex: nextDayIndex,
+      currentWallpaperIndex: Math.max(0, nextWallpaperIndex),
+      generatedWallpaperUrl: nextGeneratedUrl,
+    });
+  },
+
+  setWallpaperInteractions(items) {
+    if (!items.length) return;
+    const previous = get();
+    const syncedMessages: MessagesByDay = {
+      前天: [...previous.messagesByDay.前天],
+      昨天: [...previous.messagesByDay.昨天],
+      今天: [...previous.messagesByDay.今天],
+    };
+
+    for (const item of items) {
+      const transcript = item.transcript.trim();
+      const label = dayLabelFor(item.createdAt);
+      if (!transcript || !label) continue;
+
+      const timestamp = Date.parse(item.createdAt) || Date.now();
+      const messageId = `wallpaper-event-${item.eventSeq}`;
+      const messages = syncedMessages[label];
+      const exactIndex = messages.findIndex((message) => message.id === messageId);
+      const duplicateIndex = messages.findIndex(
+        (message) =>
+          message.from === item.speakerRole &&
+          message.text.trim() === transcript &&
+          Math.abs(message.timestamp - timestamp) < 10 * 60 * 1000,
+      );
+      const targetIndex = exactIndex >= 0 ? exactIndex : duplicateIndex;
+      const suggestedReply = item.reply.trim() || undefined;
+      const suggestedReplies = item.suggestedReplies?.filter(Boolean).slice(0, 2);
+
+      if (targetIndex >= 0) {
+        const existing = messages[targetIndex];
+        messages[targetIndex] = {
+          ...existing,
+          id: messageId,
+          from: item.speakerRole,
+          text: transcript,
+          timestamp,
+          suggestedReply: suggestedReply || existing.suggestedReply,
+          suggestedReplies: suggestedReplies?.length
+            ? suggestedReplies
+            : existing.suggestedReplies,
+          relationshipSummary:
+            item.relationshipSummary || existing.relationshipSummary,
+        };
+      } else {
+        messages.push({
+          id: messageId,
+          type: "voice_message",
+          from: item.speakerRole,
+          audioUrl: "",
+          text: transcript,
+          durationSec: 0,
+          timestamp,
+          suggestedReply,
+          suggestedReplies,
+          relationshipSummary: item.relationshipSummary,
+        });
+      }
+      messages.sort((left, right) => left.timestamp - right.timestamp);
+    }
+
+    persist(syncedMessages);
+    set({ messagesByDay: syncedMessages });
+  },
+
+  shiftWallpaper(dir: -1 | 1) {
+    const state = get();
+    let dayIndex = state.currentDayIndex;
+    let wallpaperIndex = state.currentWallpaperIndex;
+    const currentItems = state.wallpapersByDay[DAY_LABELS[dayIndex]];
+
+    if (dir === -1) {
+      if (wallpaperIndex > 0) {
+        wallpaperIndex -= 1;
+      } else if (dayIndex > 0) {
+        dayIndex -= 1;
+        wallpaperIndex = state.wallpapersByDay[DAY_LABELS[dayIndex]].length - 1;
+      }
+    } else if (wallpaperIndex < currentItems.length - 1) {
+      wallpaperIndex += 1;
+    } else if (dayIndex < DAY_LABELS.length - 1) {
+      dayIndex += 1;
+      wallpaperIndex = 0;
+    }
+
+    set({
+      currentDayIndex: dayIndex,
+      currentWallpaperIndex: wallpaperIndex,
+      focusMode: "balanced",
+    });
   },
 
   generatedWallpaperUrl: "",
   setGeneratedWallpaperUrl(url: string) {
-    set({ generatedWallpaperUrl: url });
+    if (!url) return;
+    const state = get();
+    const wasLatest = isLatestWallpaper(state);
+    const existingIndex = state.wallpapersByDay.今天.findIndex(
+      (item) => item.imageUrl === url,
+    );
+    if (existingIndex >= 0) {
+      set({ generatedWallpaperUrl: url });
+      return;
+    }
+
+    const nextItem: WallpaperItem = {
+      revisionId: `live-${Date.now()}`,
+      eventSeq: Math.max(0, state.wallpaperVersion),
+      imageUrl: url,
+      createdAt: new Date().toISOString(),
+    };
+    const today =
+      state.wallpapersByDay.今天.length === 0
+        ? [nextItem]
+        : [...state.wallpapersByDay.今天, nextItem];
+    set({
+      generatedWallpaperUrl: url,
+      wallpapersByDay: { ...state.wallpapersByDay, 今天: today },
+      ...(wasLatest
+        ? { currentDayIndex: 2, currentWallpaperIndex: today.length - 1 }
+        : {}),
+    });
+  },
+  wallpaperVersion: 0,
+  setWallpaperVersion(version) {
+    set({ wallpaperVersion: Math.max(0, version) });
+  },
+
+  initialInsertStatus: "idle",
+  setInitialInsertStatus(s) {
+    set({ initialInsertStatus: s });
+  },
+
+  wallpaperStateHydrated: false,
+  setWallpaperStateHydrated(v) {
+    set({ wallpaperStateHydrated: v });
+  },
+
+  generationSessionId: "",
+  incrementGenerationSession() {
+    const next = crypto.randomUUID();
+    set({ generationSessionId: next });
+    return next;
+  },
+
+  wallpaperEnvelope: { emotion: "calm", intensity: 0.5 },
+  setWallpaperEnvelope(env: WallpaperEnvelope) {
+    set({ wallpaperEnvelope: env });
+  },
+
+  focusMode: "balanced",
+  setFocusMode(mode) {
+    set({ focusMode: mode });
   },
 
   addMessage(partial) {
