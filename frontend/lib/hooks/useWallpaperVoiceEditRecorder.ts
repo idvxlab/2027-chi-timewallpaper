@@ -43,6 +43,26 @@ const STREAM_CHUNK_MS = 200;
 const STREAM_CHUNK_SAMPLES = (STREAM_SAMPLE_RATE * STREAM_CHUNK_MS) / 1000;
 const MIN_BLOB_BYTES = 2_000;
 
+/**
+ * Minimum wall-clock time after the recorder actually became ready before
+ * silence detection is allowed to auto-stop a recording.
+ *
+ * Rationale: the first ~1.5s after microphone / WebSocket / AudioContext
+ * are ready is usually calibration noise (warmup, echo cancellation
+ * settling, sample-rate conversion). Auto-stopping in that window would
+ * truncate legitimate speech on mobile devices with slow permission
+ * flows.
+ */
+const MIN_RECORDING_MS = 1_500;
+
+/**
+ * Default target duration of trailing silence that ends a recording.
+ * ~2.5 seconds of continuous silence is long enough to absorb natural
+ * pauses between sentences (Chinese punctuation thinking time, breathing)
+ * but short enough to feel responsive.
+ */
+const SILENCE_END_TARGET_MS = 2_500;
+
 type VoiceProfile = {
   initialEndSilenceMs: number;
   minEndSilenceMs: number;
@@ -55,22 +75,22 @@ type VoiceProfile = {
 
 const VOICE_PROFILES: Record<ViewerRole, VoiceProfile> = {
   child: {
-    initialEndSilenceMs: 750,
-    minEndSilenceMs: 650,
-    maxEndSilenceMs: 1_500,
+    initialEndSilenceMs: 2_000,
+    minEndSilenceMs: 1_500,
+    maxEndSilenceMs: 3_000,
     minSpeechMs: 300,
     maxRecordingMs: 20_000,
-    noSpeechTimeoutMs: 3_000,
-    minRms: 0.01,
+    noSpeechTimeoutMs: 6_000,
+    minRms: 0.012,
   },
   elder: {
-    initialEndSilenceMs: 1_200,
-    minEndSilenceMs: 650,
-    maxEndSilenceMs: 1_500,
+    initialEndSilenceMs: 2_500,
+    minEndSilenceMs: 1_500,
+    maxEndSilenceMs: 3_000,
     minSpeechMs: 400,
     maxRecordingMs: 30_000,
-    noSpeechTimeoutMs: 5_000,
-    minRms: 0.006,
+    noSpeechTimeoutMs: 6_000,
+    minRms: 0.008,
   },
 };
 
@@ -126,10 +146,21 @@ export function useWallpaperVoiceEditRecorder() {
   const speechStartedAtRef = useRef(0);
   const noiseFloorRef = useRef(0.004);
   const observedPausesRef = useRef<number[]>([]);
+  // Coalesce silence log spam: only log when silence state flips, or at most
+  // once per 1.5s of continuous silence.
+  const lastSilenceLogAtRef = useRef(0);
+  const lastSilenceActiveRef = useRef(false);
   const adaptiveEndSilenceRef = useRef(750);
   const timerRef = useRef<number | null>(null);
   const maxTimerRef = useRef<number | null>(null);
   const noSpeechTimerRef = useRef<number | null>(null);
+  // Wall-clock timestamp recorded the moment the real recorder pipeline
+  // (microphone + WebSocket + AudioContext) became ready. All timing-based
+  // controls (silence auto-stop, no-speech timeout, MIN_RECORDING_MS guard)
+  // MUST measure from this point — not from the moment the user clicked.
+  // On mobile, getUserMedia + WebSocket open + AudioContext.resume() can
+  // take 500ms–2s.
+  const actualRecorderReadyAtRef = useRef(0);
   const viewerRoleRef = useRef<ViewerRole>("child");
   const isBusyRef = useRef(false);
   const requestIdRef = useRef("");
@@ -143,6 +174,7 @@ export function useWallpaperVoiceEditRecorder() {
     timerRef.current = null;
     maxTimerRef.current = null;
     noSpeechTimerRef.current = null;
+    actualRecorderReadyAtRef.current = 0;
   }, []);
 
   const applyAgentResult = useCallback(
@@ -286,6 +318,7 @@ export function useWallpaperVoiceEditRecorder() {
   const finishStreamingRecording = useCallback(() => {
     if (endingRef.current || streamFinishedRef.current) return;
     endingRef.current = true;
+    console.log("[VOICE] stop_requested reason=stream_finish");
     clearTimers();
     cleanupStreamingAudio();
     flushStreamingPacket(true);
@@ -309,11 +342,17 @@ export function useWallpaperVoiceEditRecorder() {
     }
     socket.send(JSON.stringify({ type: "end" }));
     setStatus("transcribing");
+    console.log("[VOICE] recorder_stopped", {
+      mode: "stream",
+      durationMs,
+      reason: "user_or_silence",
+    });
   }, [clearTimers, cleanupStreamingAudio, closeStreamSocket, flushStreamingPacket, setStatus]);
 
   const finishFlashRecording = useCallback(() => {
     const recorder = mediaRecorderRef.current;
     if (!recorder || recorder.state === "inactive") return;
+    console.log("[VOICE] stop_requested reason=flash_finish");
     clearTimers();
     const durationMs = Date.now() - startedAtRef.current;
     setElapsedSec(0);
@@ -333,6 +372,11 @@ export function useWallpaperVoiceEditRecorder() {
     }
     recorder.stop();
     setStatus("transcribing");
+    console.log("[VOICE] recorder_stopped", {
+      mode: "flash",
+      durationMs,
+      reason: "user_or_silence",
+    });
   }, [clearTimers, processFlashRecording, setStatus]);
 
   const startFlashRecording = useCallback(
@@ -373,6 +417,9 @@ export function useWallpaperVoiceEditRecorder() {
           () => reject(new Error("streaming ASR connection timed out")),
           15_000,
         );
+        socket.onopen = () => {
+          console.log("[VOICE] websocket_ready");
+        };
         socket.onmessage = (event) => {
           if (typeof event.data !== "string") return;
           const message = JSON.parse(event.data) as {
@@ -389,6 +436,7 @@ export function useWallpaperVoiceEditRecorder() {
               }),
             );
           } else if (message.type === "started") {
+            console.log("[VOICE] websocket_started_ack");
             window.clearTimeout(timeout);
             resolve();
           } else if (message.type === "asr_final") {
@@ -473,6 +521,12 @@ export function useWallpaperVoiceEditRecorder() {
         const rms = calculateRms(input);
         const threshold = Math.max(profile.minRms, noiseFloorRef.current * 2.5);
         if (rms >= threshold) {
+          // Speech resumed — cancel any pending silence log.
+          if (lastSilenceActiveRef.current) {
+            console.log("[VOICE] silence_cancelled");
+            lastSilenceActiveRef.current = false;
+            lastSilenceLogAtRef.current = 0;
+          }
           if (lastSpeechAtRef.current > 0) {
             const pause = now - lastSpeechAtRef.current;
             if (pause >= 150 && pause < adaptiveEndSilenceRef.current) {
@@ -492,15 +546,49 @@ export function useWallpaperVoiceEditRecorder() {
           if (!speechStartedAtRef.current) {
             noiseFloorRef.current = noiseFloorRef.current * 0.94 + rms * 0.06;
           } else if (
+            // Only allow silence-triggered stop AFTER the recorder has
+            // been actually recording for MIN_RECORDING_MS. This absorbs
+            // warmup noise from microphone / AudioContext / WebSocket
+            // pipeline that may look like a brief speech blip.
+            Date.now() - actualRecorderReadyAtRef.current >= MIN_RECORDING_MS &&
             now - speechStartedAtRef.current >= profile.minSpeechMs &&
             now - lastSpeechAtRef.current >= adaptiveEndSilenceRef.current
           ) {
+            // Logged once when silence-run actually triggers auto-stop.
+            console.log("[VOICE] auto_stop_triggered", {
+              reason: "silence",
+              adaptiveMs: adaptiveEndSilenceRef.current,
+            });
             finishStreamingRecording();
+          } else if (
+            speechStartedAtRef.current &&
+            Date.now() - actualRecorderReadyAtRef.current >= MIN_RECORDING_MS &&
+            !lastSilenceActiveRef.current
+          ) {
+            // Edge-detected silence start (after MIN_RECORDING_MS guard).
+            console.log("[VOICE] silence_started", {
+              threshold: adaptiveEndSilenceRef.current,
+            });
+            lastSilenceActiveRef.current = true;
+            lastSilenceLogAtRef.current = now;
+          } else if (
+            lastSilenceActiveRef.current &&
+            now - lastSilenceLogAtRef.current >= 1_500
+          ) {
+            // Periodic keep-alive log while silence continues.
+            console.log("[VOICE] silence_continuing", {
+              elapsedMs: now - lastSpeechAtRef.current,
+            });
+            lastSilenceLogAtRef.current = now;
           }
         }
       };
       source.connect(processor);
       processor.connect(context.destination);
+      console.log("[VOICE] audio_ready", {
+        sampleRate: context.sampleRate,
+        streamTracks: stream.getTracks().length,
+      });
     },
     [
       applyAgentResult,
@@ -514,165 +602,197 @@ export function useWallpaperVoiceEditRecorder() {
     ],
   );
 
-  const startRecording = useCallback(async (source: RecorderSource) => {
-    if (isBusyRef.current || mediaRecorderRef.current || streamSocketRef.current)
-      return;
-    const scene = useSceneStore.getState();
-    if (!isLatestWallpaper(scene) || !scene.generatedWallpaperUrl) {
-      console.warn("[WallpaperVoiceEdit] select the latest wallpaper before recording");
-      return;
-    }
-    const interactionMode = getWallpaperInteractionMode(scene);
-    if (
-      (source === "central_button" &&
-        interactionMode !== "initial_voice" &&
-        interactionMode !== "processing") ||
-      (source === "subject_lift" && interactionMode !== "subject_lift")
-    ) {
-      console.warn(
-        `[WallpaperVoiceEdit] ${source} rejected: mode=${interactionMode}`,
-      );
-      return;
-    }
-
-    try {
-      const current = await getCurrentWallpaper();
-      if (source === "central_button" && current.stage === "wallpaper_active") {
+  const startRecording = useCallback(
+    async (source: RecorderSource): Promise<boolean> => {
+      console.log("[VOICE] start_requested", { source });
+      if (isBusyRef.current || mediaRecorderRef.current || streamSocketRef.current) {
+        console.log("[VOICE] start_rejected: already busy or running");
+        return false;
+      }
+      const scene = useSceneStore.getState();
+      if (!isLatestWallpaper(scene) || !scene.generatedWallpaperUrl) {
         console.warn(
-          "[WallpaperVoiceEdit] central button not allowed after first voice is done",
+          "[VOICE] start_rejected: select the latest wallpaper before recording",
         );
-        return;
+        return false;
       }
-      if (source === "subject_lift" && current.stage !== "wallpaper_active") {
+      const interactionMode = getWallpaperInteractionMode(scene);
+      if (
+        (source === "central_button" &&
+          interactionMode !== "initial_voice" &&
+          interactionMode !== "processing") ||
+        (source === "subject_lift" && interactionMode !== "subject_lift")
+      ) {
         console.warn(
-          "[WallpaperVoiceEdit] subject lift not allowed before first voice",
+          `[VOICE] start_rejected: ${source} mode=${interactionMode}`,
         );
-        return;
+        return false;
       }
-    } catch (error) {
-      console.error(
-        "[WallpaperVoiceEdit] cannot reach backend stage, recording aborted",
-        error,
-      );
-      return;
-    }
-    if (!navigator.mediaDevices?.getUserMedia) {
-      console.error("[WallpaperVoiceEdit] browser does not support recording");
-      return;
-    }
-    activeSourceRef.current = source;
-    const requestedMode =
-      source === "central_button" ? "flash" : useVoiceRuntimeStore.getState().mode;
-    if (
-      requestedMode === "flash" &&
-      !window.MediaRecorder
-    ) {
-      console.error("[WallpaperVoiceEdit] browser does not support MediaRecorder");
-      return;
-    }
 
-    let stream: MediaStream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-    } catch {
-      console.error("[WallpaperVoiceEdit] microphone permission denied");
-      return;
-    }
-
-    const profile = VOICE_PROFILES[viewerRoleRef.current];
-    startedAtRef.current = Date.now();
-    requestIdRef.current = crypto.randomUUID();
-    lastSpeechAtRef.current = 0;
-    speechStartedAtRef.current = 0;
-    observedPausesRef.current = [];
-    adaptiveEndSilenceRef.current = profile.initialEndSilenceMs;
-    noiseFloorRef.current = 0.004;
-    pendingPcmRef.current = new Int16Array(0);
-    allPcmRef.current = [];
-    streamFinishedRef.current = false;
-    streamAsrFinalRef.current = false;
-    endingRef.current = false;
-    isBusyRef.current = true;
-    setElapsedSec(0);
-
-    let activeMode = requestedMode;
-    try {
-      if (activeMode === "stream") {
-        await startStreamingRecording(stream);
-      } else {
-        await startFlashRecording(stream);
-      }
-    } catch (error) {
-      if (activeMode === "stream" && allPcmRef.current.length === 0) {
-        console.warn(
-          "[WallpaperVoiceEdit] streaming could not start; recording with flash",
+      try {
+        const current = await getCurrentWallpaper();
+        if (source === "central_button" && current.stage === "wallpaper_active") {
+          console.warn(
+            "[VOICE] start_rejected: central button not allowed after first voice is done",
+          );
+          return false;
+        }
+        if (source === "subject_lift" && current.stage !== "wallpaper_active") {
+          console.warn(
+            "[VOICE] start_rejected: subject lift not allowed before first voice",
+          );
+          return false;
+        }
+      } catch (error) {
+        console.error(
+          "[VOICE] cannot reach backend stage, recording aborted",
           error,
         );
-        closeStreamSocket();
-        activeMode = "flash";
-        await startFlashRecording(stream);
-      } else {
-        stream.getTracks().forEach((track) => track.stop());
-        isBusyRef.current = false;
-        if (!streamFinishedRef.current) {
-          fallbackStreamToFlash(
-            error instanceof Error ? error.message : String(error),
-          );
-        }
-        return;
+        return false;
       }
-    }
+      if (!navigator.mediaDevices?.getUserMedia) {
+        console.error("[VOICE] browser does not support recording");
+        return false;
+      }
+      activeSourceRef.current = source;
+      const requestedMode =
+        source === "central_button"
+          ? "flash"
+          : useVoiceRuntimeStore.getState().mode;
+      if (requestedMode === "flash" && !window.MediaRecorder) {
+        console.error("[VOICE] browser does not support MediaRecorder");
+        return false;
+      }
 
-    setStatus("recording");
-    timerRef.current = window.setInterval(() => {
-      setElapsedSec(Math.round((Date.now() - startedAtRef.current) / 1000));
-    }, 200);
-    maxTimerRef.current = window.setTimeout(() => {
-      if (activeMode === "stream")
-        finishStreamingRecording();
-      else finishFlashRecording();
-    }, profile.maxRecordingMs);
-    if (activeMode === "stream") {
-      noSpeechTimerRef.current = window.setTimeout(() => {
-        if (!speechStartedAtRef.current) finishStreamingRecording();
-      }, profile.noSpeechTimeoutMs);
-    }
-  }, [
-    fallbackStreamToFlash,
-    finishFlashRecording,
-    finishStreamingRecording,
-    closeStreamSocket,
-    setStatus,
-    setRuntimeMode,
-    startFlashRecording,
-    startStreamingRecording,
-  ]);
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        console.log("[VOICE] microphone_ready");
+      } catch (error) {
+        console.error("[VOICE] microphone permission denied", error);
+        return false;
+      }
+
+      const profile = VOICE_PROFILES[viewerRoleRef.current];
+      startedAtRef.current = Date.now();
+      // Mark "requested" so the stop-anywhere listener knows NOT to enter
+      // recorder_error while we're still mid-startup. The true value will be
+      // re-set right after the pipeline reports ready.
+      actualRecorderReadyAtRef.current = 0;
+      requestIdRef.current = crypto.randomUUID();
+      lastSpeechAtRef.current = 0;
+      speechStartedAtRef.current = 0;
+      observedPausesRef.current = [];
+      adaptiveEndSilenceRef.current = SILENCE_END_TARGET_MS;
+      noiseFloorRef.current = 0.004;
+      pendingPcmRef.current = new Int16Array(0);
+      allPcmRef.current = [];
+      streamFinishedRef.current = false;
+      streamAsrFinalRef.current = false;
+      endingRef.current = false;
+      isBusyRef.current = true;
+      setElapsedSec(0);
+
+      let activeMode = requestedMode;
+      try {
+        if (activeMode === "stream") {
+          await startStreamingRecording(stream);
+        } else {
+          await startFlashRecording(stream);
+        }
+      } catch (error) {
+        if (activeMode === "stream" && allPcmRef.current.length === 0) {
+          console.warn(
+            "[VOICE] streaming could not start; recording with flash",
+            error,
+          );
+          closeStreamSocket();
+          activeMode = "flash";
+          await startFlashRecording(stream);
+        } else {
+          console.error("[VOICE] pipeline start failed", error);
+          stream.getTracks().forEach((track) => track.stop());
+          isBusyRef.current = false;
+          if (!streamFinishedRef.current) {
+            fallbackStreamToFlash(
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+          return false;
+        }
+      }
+
+      // Recorder pipeline is fully ready: microphone + WebSocket +
+      // AudioContext + (MediaRecorder fallback). Anchor all timing-based
+      // controls from THIS moment, NOT from the user click.
+      actualRecorderReadyAtRef.current = Date.now();
+      console.log("[VOICE] recording_started", {
+        activeMode,
+        readyAt: actualRecorderReadyAtRef.current,
+      });
+      setStatus("recording");
+      timerRef.current = window.setInterval(() => {
+        setElapsedSec(Math.round((Date.now() - startedAtRef.current) / 1000));
+      }, 200);
+      maxTimerRef.current = window.setTimeout(() => {
+        if (activeMode === "stream") finishStreamingRecording();
+        else finishFlashRecording();
+      }, profile.maxRecordingMs);
+      if (activeMode === "stream") {
+        noSpeechTimerRef.current = window.setTimeout(() => {
+          if (!speechStartedAtRef.current) finishStreamingRecording();
+        }, profile.noSpeechTimeoutMs);
+      }
+      return true;
+    },
+    [
+      fallbackStreamToFlash,
+      finishFlashRecording,
+      finishStreamingRecording,
+      closeStreamSocket,
+      setStatus,
+      setRuntimeMode,
+      startFlashRecording,
+      startStreamingRecording,
+    ],
+  );
 
   const finishRecording = useCallback(() => {
+    console.log("[VOICE] stop_requested reason=user_or_layer");
     if (streamSocketRef.current) finishStreamingRecording();
     else finishFlashRecording();
   }, [finishFlashRecording, finishStreamingRecording]);
 
   const toggle = useCallback(
-    (viewerRole?: ViewerRole) => {
+    async (viewerRole?: ViewerRole) => {
       if (viewerRole) viewerRoleRef.current = viewerRole;
-      if (status === "idle") void startRecording("central_button");
-      else if (status === "recording") finishRecording();
+      if (status === "idle") {
+        const ok = await startRecording("central_button");
+        console.log("[VOICE] toggle result", { ok });
+      } else if (status === "recording") {
+        console.log("[VOICE] stop_requested reason=toggle");
+        finishRecording();
+      }
     },
     [finishRecording, startRecording, status],
   );
 
   const start = useCallback(
-    (viewerRole: ViewerRole, source: RecorderSource = "subject_lift") => {
+    (
+      viewerRole: ViewerRole,
+      source: RecorderSource = "subject_lift",
+    ): Promise<boolean> => {
       viewerRoleRef.current = viewerRole;
-      if (status === "idle") void startRecording(source);
+      if (status === "idle") return startRecording(source);
+      // Not idle: already running or busy — caller should not transition.
+      return Promise.resolve(false);
     },
     [startRecording, status],
   );

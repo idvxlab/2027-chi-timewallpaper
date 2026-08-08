@@ -106,6 +106,7 @@ export function SubjectLiftLayer({
     startRecording,
     stopRecording,
     registerRecorderBridge,
+    hasEnteredRecording,
   } = useSubjectLift({ imageSize, focusMode });
   const interactionActive =
     state.status !== "idle" && state.status !== "error";
@@ -125,13 +126,16 @@ export function SubjectLiftLayer({
     useWallpaperVoiceEditRecorder();
 
   // Wire recorder hooks into the subject-lift hook so it can fire them.
+  // The bridge contract is Promise<boolean>: true only after the underlying
+  // recorder pipeline (microphone + WebSocket + AudioContext) is verified
+  // ready. We MUST await the real result before signalling "recording" — a
+  // fire-and-forget here would cause SubjectLift to flash recording and
+  // immediately fall back to idle before the real recorder becomes live.
   useEffect(() => {
     registerRecorderBridge(
-      (vr) => {
-        recorderStart(vr);
-        return true;
-      },
+      (vr) => recorderStart(vr),
       () => {
+        console.log("[VOICE] stop_requested reason=subject_layer_bridge");
         recorderStop();
       },
     );
@@ -206,6 +210,27 @@ export function SubjectLiftLayer({
         id: Date.now(),
         loadFailed: false,
       });
+    } else if (state.status === "starting") {
+      // Visual contract: while the recorder pipeline is starting up, the
+      // cutout stays exactly where it was in armed_lifted. The animation
+      // reuses the same bbox; no flash, no relayout.
+      const s = state as Extract<LiftState, { status: "starting" }>;
+      setDisplayed((prev) =>
+        prev
+          ? {
+              ...prev,
+              cutoutUrl: s.cutoutUrl,
+              bbox: s.bbox,
+              region: s.region,
+            }
+          : {
+              cutoutUrl: s.cutoutUrl,
+              bbox: s.bbox,
+              region: s.region,
+              id: Date.now(),
+              loadFailed: false,
+            },
+      );
     } else if (state.status === "recording") {
       // Keep the displayed cutout during recording. The visual keeps
       // the cutout url/bbox the same so the pulse animation runs on it.
@@ -242,6 +267,7 @@ export function SubjectLiftLayer({
   // ── Background dim ─────────────────────────────────────────────────
   const isLifted =
     state.status === "armed_lifted" ||
+    state.status === "starting" ||
     state.status === "recording" ||
     state.status === "waiting_for_release" ||
     state.status === "releasing";
@@ -344,6 +370,19 @@ export function SubjectLiftLayer({
   // If we somehow reach a non-idle status without going through releasing
   // (e.g. recorder error), force a release so the subject never gets stuck.
   useEffect(() => {
+    // While we are still in "starting" the recorder has not yet reported
+    // its real status — the recorder store is still at "idle". Under no
+    // circumstance may we interpret that as a recorder_error.
+    if (state.status === "starting") {
+      return;
+    }
+    // Only after the lift has actually entered "recording" is a
+    // voiceStatus flip to idle / transcribing / editing valid evidence of
+    // a real recorder completion. Before that, every voiceStatus change is
+    // a startup-phase race that must be ignored.
+    if (!hasEnteredRecording) {
+      return;
+    }
     if (
       voiceStatus === "transcribing" ||
       voiceStatus === "editing" ||
@@ -355,11 +394,12 @@ export function SubjectLiftLayer({
           "[SubjectLiftLayer] recorder finished externally, force releasing",
           { voiceStatus },
         );
-        const s = state as Extract<LiftState, { status: "recording" }>;
-        stopRecording(voiceStatus === "idle" ? "recorder_error" : "recorder_auto_stop");
+        stopRecording(
+          voiceStatus === "idle" ? "recorder_error" : "recorder_auto_stop",
+        );
       }
     }
-  }, [voiceStatus, state, stopRecording]);
+  }, [voiceStatus, state.status, stopRecording, hasEnteredRecording]);
 
   // ── Render ────────────────────────────────────────────────────────
   return (
@@ -438,7 +478,9 @@ export function SubjectLiftLayer({
           wallpaperRect={wallpaperRect}
           wallpaperPositionX={wallpaperPositionX}
           naturalSize={imageSize}
-          isArmed={state.status === "armed_lifted"}
+          isArmed={
+            state.status === "armed_lifted" || state.status === "starting"
+          }
           isRecording={state.status === "recording"}
           isReleasing={state.status === "releasing"}
           onSubjectClickStart={handleSubjectClickStart}

@@ -439,6 +439,12 @@ export type LiftState =
       region: SubjectRegion;
     }
   | {
+      status: "starting";
+      cutoutUrl: string;
+      bbox: { x: number; y: number; width: number; height: number };
+      region: SubjectRegion;
+    }
+  | {
       status: "recording";
       cutoutUrl: string;
       bbox: { x: number; y: number; width: number; height: number };
@@ -521,7 +527,18 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   // The hook receives the imperative recorder handle from the layer so the
   // stop request is funneled through here.
   const onStopRecordingRef = useRef<(() => void) | null>(null);
-  const onStartRecordingRef = useRef<((viewerRole: ViewerRole) => boolean) | null>(null);
+  // Recorder start contract: must return a Promise that resolves to true if
+  // the underlying recorder pipeline (microphone + WebSocket + AudioContext)
+  // actually became ready, false on any failure. Returning true synchronously
+  // is no longer supported — callers must await the real result.
+  const onStartRecordingRef = useRef<
+    ((viewerRole: ViewerRole) => Promise<boolean>) | null
+  >(null);
+  // Tracks whether the lift ever reached "recording" so we can tell real
+  // recorder stop events apart from startup-phase idle -> recording flips.
+  // This ref is mirrored into a tick-based state at the bottom of the hook
+  // so React effects in the layer can subscribe to its changes.
+  const hasEnteredRecordingRef = useRef(false);
 
   // ── Synchronous state mirror ─────────────────────────────────────────
   // Keeps a ref in sync with the React state so async callbacks (cache hits,
@@ -723,6 +740,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       clearArmedTimeout();
       extractionResultRef.current = null;
       firstReleaseDoneRef.current = false;
+      setHasEnteredRecording(false);
       transitionState({ status: "idle" });
     }
   }, [canLift, cancelPress, clearArmedTimeout]);
@@ -733,6 +751,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     const id = window.setTimeout(() => {
       extractionResultRef.current = null;
       firstReleaseDoneRef.current = false;
+      setHasEnteredRecording(false);
       transitionState({ status: "idle" });
     }, RELEASING_DURATION_MS);
     return () => window.clearTimeout(id);
@@ -1077,6 +1096,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       cancelPress();
       firstReleaseDoneRef.current = false;
       extractionResultRef.current = null;
+      setHasEnteredRecording(false);
       const sessionId = ++pressSessionIdRef.current;
 
       transitionState({
@@ -1218,6 +1238,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       } else {
         extractionResultRef.current = null;
         firstReleaseDoneRef.current = false;
+        setHasEnteredRecording(false);
         transitionState({ status: "idle" });
       }
     },
@@ -1239,83 +1260,193 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   }, [cancelPress, clearArmedTimeout]);
 
   // ── Start recording (called by layer on second tap) ─────────────────
-  // Clears the 10-second armed timeout, returns true if recording may start.
-  const startRecording = useCallback((viewerRole: ViewerRole) => {
-    if (state.status !== "armed_lifted") {
-      console.log(
-        "[SubjectLift] startRecording blocked: not armed_lifted",
-        state.status,
-      );
-      return false;
-    }
+  // Clears the 10-second armed timeout, transitions through "starting" while
+  // awaiting the real recorder pipeline, and only enters "recording" once
+  // the pipeline is verified live. If the pipeline fails, the state falls
+  // back to "armed_lifted" so the subject visual stays lifted and the user
+  // can retry — never a phantom recorder.
+  const startRecording = useCallback(
+    async (viewerRole: ViewerRole): Promise<boolean> => {
+      if (state.status !== "armed_lifted") {
+        console.log(
+          "[SubjectLift] startRecording blocked: not armed_lifted",
+          state.status,
+        );
+        return false;
+      }
 
-    // Clear the armed timeout — recording is now in control.
-    clearArmedTimeout();
-    recordingStartedAtRef.current = Date.now();
-    const result = extractionResultRef.current;
-    if (result) {
+      // Snapshot current visual state for the await.
+      const result = extractionResultRef.current;
+      if (!result) {
+        console.log("[SubjectLift] startRecording blocked: no extraction result");
+        return false;
+      }
+
+      // Clear the armed timeout — recording is now in control.
+      clearArmedTimeout();
+      recordingStartedAtRef.current = Date.now();
+
+      console.log("[SUBJECT_LIFT] starting", {
+        region: result.region,
+        viewerRole,
+      });
       console.log("[subject_lift_transition]", {
         from: "armed_lifted",
-        to: "recording",
+        to: "starting",
         reason: "user_second_tap",
         sessionId: pressSessionIdRef.current,
       });
+      transitionState({ status: "starting", ...result });
+
+      // Await real recorder readiness. The bridge contract is Promise<boolean>.
+      const startHook = onStartRecordingRef.current;
+      if (!startHook) {
+        console.warn(
+          "[SubjectLift] startRecording aborted: no recorder bridge registered",
+        );
+        // Roll back to armed_lifted so the user can tap again.
+        transitionState({ status: "armed_lifted", ...result });
+        return false;
+      }
+
+      let ok = false;
+      try {
+        ok = await startHook(viewerRole);
+      } catch (err) {
+        console.error("[SubjectLift] recorder bridge threw", err);
+        ok = false;
+      }
+
+      if (!ok) {
+        console.log(
+          "[SUBJECT_LIFT] recorder_start_failed returning to armed_lifted",
+          {
+            viewerRole,
+          },
+        );
+        // Roll back to armed_lifted — do NOT animate the cutout away.
+        transitionState({ status: "armed_lifted", ...result });
+        return false;
+      }
+
+      hasEnteredRecordingRef.current = true;
+      setHasEnteredRecording(true);
+      console.log("[SUBJECT_LIFT] recording", {
+        region: result.region,
+        viewerRole,
+      });
+      console.log("[subject_lift_transition]", {
+        from: "starting",
+        to: "recording",
+        reason: "recorder_pipeline_ready",
+        sessionId: pressSessionIdRef.current,
+      });
       transitionState({ status: "recording", ...result });
-    }
-    console.log("[SubjectLift] startRecording: cleared armed timeout");
-    void onStartRecordingRef.current?.(viewerRole);
-    return true;
-  }, [state.status, clearArmedTimeout]);
+      return true;
+    },
+    [state.status, clearArmedTimeout],
+  );
 
   // ── Stop recording (called by layer on click-anywhere-while-recording) ──
   // Triggers the recorder stop (which will eventually flip status to
   // "transcribing/editing") and immediately enters the releasing animation.
-  const stopRecording = useCallback((trigger: "user_stop" | "recorder_error" | "recorder_auto_stop" = "user_stop") => {
-    if (state.status !== "recording") {
-      console.log("[SubjectLift] stopRecording blocked: not recording", state.status);
-      return false;
-    }
-    const result = extractionResultRef.current;
-    if (!result) {
-      console.log("[SubjectLift] stopRecording blocked: no extraction result");
-      return false;
-    }
+  const stopRecording = useCallback(
+    (
+      trigger:
+        | "user_stop"
+        | "recorder_error"
+        | "recorder_auto_stop"
+        | "starting_cancelled" = "user_stop",
+    ): boolean => {
+      // Special path: stop while still "starting" means the user clicked
+      // again before the recorder pipeline finished. Roll back to
+      // armed_lifted without telling the recorder to stop (it never really
+      // started, or it failed and already returned false upstream).
+      if (state.status === "starting") {
+        const result = extractionResultRef.current;
+        if (!result) {
+          transitionState({ status: "idle" });
+          return false;
+        }
+        console.log(
+          "[SubjectLift] stopRecording while starting: rolling back to armed_lifted",
+          { trigger },
+        );
+        transitionState({ status: "armed_lifted", ...result });
+        return true;
+      }
+      if (state.status !== "recording") {
+        console.log(
+          "[SubjectLift] stopRecording blocked: not recording",
+          state.status,
+        );
+        return false;
+      }
+      const result = extractionResultRef.current;
+      if (!result) {
+        console.log("[SubjectLift] stopRecording blocked: no extraction result");
+        return false;
+      }
 
-    // Guard against the SAME pointer session that started recording
-    // immediately triggering stop. The 300ms window absorbs the synthetic
-    // click that follows pointerdown/click on the lifted subject.
-    const sinceStart = Date.now() - recordingStartedAtRef.current;
-    if (sinceStart < REC_START_STOP_GUARD_MS) {
-      console.log("[SubjectLift] stopRecording suppressed by start-guard", { sinceStart });
-      return false;
-    }
+      // Guard against the SAME pointer session that started recording
+      // immediately triggering stop. The 300ms window absorbs the synthetic
+      // click that follows pointerdown/click on the lifted subject.
+      const sinceStart = Date.now() - recordingStartedAtRef.current;
+      if (sinceStart < REC_START_STOP_GUARD_MS) {
+        console.log("[SubjectLift] stopRecording suppressed by start-guard", {
+          sinceStart,
+        });
+        return false;
+      }
 
-    console.log("[subject_lift_transition]", {
-      from: "recording",
-      to: "releasing",
-      reason: `stop_recording:${trigger}`,
-      sessionId: pressSessionIdRef.current,
-    });
-    console.log(`[subject_lift_release] reason=${trigger} status=recording`);
-    clearArmedTimeout();
-    transitionState({ status: "releasing", ...result });
-    // Tell the layer to actually stop the recorder (media recorder stop is
-    // async; the recorder will transition to "transcribing/editing" later
-    // but the visual fall-back must begin immediately).
-    void onStopRecordingRef.current?.();
-    return true;
-  }, [state.status, clearArmedTimeout]);
+      console.log("[SUBJECT_LIFT] releasing", { trigger });
+      console.log("[subject_lift_transition]", {
+        from: "recording",
+        to: "releasing",
+        reason: `stop_recording:${trigger}`,
+        sessionId: pressSessionIdRef.current,
+      });
+      console.log(`[subject_lift_release] reason=${trigger} status=recording`);
+      clearArmedTimeout();
+      hasEnteredRecordingRef.current = false;
+      setHasEnteredRecording(false);
+      transitionState({ status: "releasing", ...result });
+      // Tell the layer to actually stop the recorder (media recorder stop is
+      // async; the recorder will transition to "transcribing/editing" later
+      // but the visual fall-back must begin immediately).
+      void onStopRecordingRef.current?.();
+      return true;
+    },
+    [state.status, clearArmedTimeout],
+  );
 
   // Allow the layer to install the actual recorder start/stop hooks
   // without re-creating our callbacks. The recorder owns the long-lived
   // MediaRecorder instance.
-  const registerRecorderBridge = useCallback((
-    startHook: ((viewerRole: ViewerRole) => boolean) | null,
-    stopHook: (() => void) | null,
-  ) => {
-    onStartRecordingRef.current = startHook;
-    onStopRecordingRef.current = stopHook;
-  }, []);
+  const registerRecorderBridge = useCallback(
+    (
+      startHook: ((viewerRole: ViewerRole) => Promise<boolean>) | null,
+      stopHook: (() => void) | null,
+    ) => {
+      onStartRecordingRef.current = startHook;
+      onStopRecordingRef.current = stopHook;
+    },
+    [],
+  );
+
+  // Expose whether the lift has ever reached "recording" in this session.
+  // We use a tick-based forceUpdate so consumers re-render when the flag
+  // flips. The flag is read via getHasEnteredRecording() so React effects
+  // can compare against previous render value.
+  const [, forceRender] = useState(0);
+  function getHasEnteredRecording(): boolean {
+    return hasEnteredRecordingRef.current;
+  }
+  function setHasEnteredRecording(value: boolean): void {
+    if (hasEnteredRecordingRef.current === value) return;
+    hasEnteredRecordingRef.current = value;
+    forceRender((n) => n + 1);
+  }
 
   return {
     state,
@@ -1325,6 +1456,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     startRecording,
     stopRecording,
     registerRecorderBridge,
+    hasEnteredRecording: getHasEnteredRecording(),
     handlers: {
       onPointerDown,
       onPointerMove,

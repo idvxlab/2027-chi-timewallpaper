@@ -42,6 +42,10 @@ export function decidePointerUp(state: LiftState): PointerUpDecision {
       return { kind: "mark_release_done" };
     case "armed_lifted":
       return { kind: "noop_armed" };
+    case "starting":
+      // pointerup during the recorder-startup window is a no-op for the
+      // lift state machine — the recorder bridge owns the audio lifecycle.
+      return { kind: "noop_armed" };
     case "recording":
       // The hook doesn't explicitly handle recording in pointerup;
       // falls through to the implicit "noop" branch.

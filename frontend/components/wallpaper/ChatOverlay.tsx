@@ -397,24 +397,7 @@ function OriginalChatHistorySection({
       }}
     >
       {/* Section title */}
-      <div className="mb-4 flex shrink-0 items-center gap-2.5">
-        <span
-          className="flex h-7 w-7 items-center justify-center rounded-lg"
-          style={{ background: "rgba(176,92,255,0.12)" }}
-          aria-hidden
-        >
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="#7A3FB8"
-            strokeWidth="2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="h-4 w-4"
-          >
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-          </svg>
-        </span>
+      <div className="mb-4 flex shrink-0 items-center justify-center gap-0">
         <h2
           style={{
             fontSize: 28,
