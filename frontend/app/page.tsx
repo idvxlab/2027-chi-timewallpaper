@@ -70,18 +70,20 @@ export default function Page() {
   // ChatOverlay here — doing so would render the overlay twice and
   // double every interaction handler.
   return (
-    <main className="min-h-screen flex items-center justify-center p-6 bg-slate-100">
-      <IpadFrame>
-        {isRestoring ? (
-          <div className="flex h-full items-center justify-center bg-white text-sm text-slate-500">
-            Loading...
-          </div>
-        ) : step !== "wallpaper" ? (
+    <main className="flex h-[100dvh] min-h-[100vh] w-full flex-col">
+      {isRestoring ? (
+        <div className="flex h-full w-full flex-1 items-center justify-center bg-white text-sm text-slate-500">
+          Loading...
+        </div>
+      ) : step !== "wallpaper" ? (
+        <div className="h-full w-full flex-1 bg-[#eee7da]">
           <OnboardingFlow />
-        ) : (
+        </div>
+      ) : (
+        <div className="h-full w-full flex-1">
           <WallpaperStage />
-        )}
-      </IpadFrame>
+        </div>
+      )}
     </main>
   );
 }

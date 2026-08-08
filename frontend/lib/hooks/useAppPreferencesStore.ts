@@ -13,7 +13,7 @@ export type AppPreferencesState = {
 export const useAppPreferencesStore = create<AppPreferencesState>()(
   persist(
     (set) => ({
-      language: "en",
+      language: "zh",
 
       setLanguage(language) {
         set({ language });
