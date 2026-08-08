@@ -7,12 +7,12 @@ import { apiUrl, assetUrl, websocketUrl } from "@/lib/config";
  */
 export const API_BASE = (() => {
   const raw = (process.env.NEXT_PUBLIC_API_BASE_URL ?? "").trim();
-  if (raw.startsWith("http://") || raw.startsWith("https://")) return raw.replace(/\/$/, "");
+  if (raw.startsWith("http://") || raw.startsWith("https://"))
+    return raw.replace(/\/$/, "");
   return "";
 })();
 
-export const STATIC_BASE_SCENE_PATH =
-  "/generated/background.png";
+export const STATIC_BASE_SCENE_PATH = "/generated/background.png";
 
 const LEGACY_BASE_SCENE_PATHS = new Set([
   "/generated/wallpaper-main-square-1536.png",
@@ -153,6 +153,49 @@ export async function logoutSession(): Promise<void> {
   }
 }
 
+export type ExperimentEventInput = {
+  eventName: string;
+  sceneId?: string;
+  updateId?: string;
+  payload?: Record<string, unknown>;
+};
+
+/** Record a browser-side study event using the authenticated session identity. */
+export async function recordExperimentEvent(
+  input: ExperimentEventInput,
+): Promise<void> {
+  const now = new Date();
+  const timezoneOffsetMinutes = -now.getTimezoneOffset();
+  const local = new Date(now.getTime() + timezoneOffsetMinutes * 60_000);
+  const studyDay = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+  ].join("-");
+
+  const response = await fetch(apiUrl("/experiment-events"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    keepalive: true,
+    body: JSON.stringify({
+      eventName: input.eventName,
+      occurredAtUtc: now.toISOString(),
+      occurredAtLocal: local.toISOString().replace(/Z$/, ""),
+      timezoneName:
+        Intl.DateTimeFormat().resolvedOptions().timeZone || "unknown",
+      timezoneOffsetMinutes,
+      studyDay,
+      sceneId: input.sceneId || "",
+      updateId: input.updateId || "",
+      payload: input.payload || {},
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`Experiment event failed (${response.status})`);
+  }
+}
+
 export type CharacterAsset = {
   assetId: string;
   userId: string;
@@ -215,10 +258,13 @@ export async function uploadMyCharacterAsset(
 }
 
 export async function getCurrentRelationshipCharacterAssets(): Promise<RelationshipCharacterAssets> {
-  const response = await fetch(apiUrl("/character-assets/current-relationship"), {
-    credentials: "include",
-    cache: "no-store",
-  });
+  const response = await fetch(
+    apiUrl("/character-assets/current-relationship"),
+    {
+      credentials: "include",
+      cache: "no-store",
+    },
+  );
   if (!response.ok) {
     throw new Error(`Character status failed (${response.status})`);
   }
@@ -653,11 +699,16 @@ export type InsertCharactersResult = {
 export async function insertCharacters(
   params: InsertCharactersParams,
 ): Promise<InsertCharactersResult> {
-  console.log("[api.insertCharacters] POST /generate-wallpaper/insert-characters start");
+  console.log(
+    "[api.insertCharacters] POST /generate-wallpaper/insert-characters start",
+  );
   console.log("[api.insertCharacters] baseImageUrl =", params.baseImageUrl);
   console.log("[api.insertCharacters] transcript =", params.transcript);
   console.log("[api.insertCharacters] viewerRole =", params.viewerRole);
-  console.log("[api.insertCharacters] speechRecognized =", params.speechRecognized);
+  console.log(
+    "[api.insertCharacters] speechRecognized =",
+    params.speechRecognized,
+  );
   console.log(
     "[api.insertCharacters] youngerImage size/type =",
     params.youngerImage.size,
@@ -780,10 +831,10 @@ export async function extractSubject(
 ): Promise<ExtractSubjectResult> {
   console.log("[api.extractSubject] POST /extract-subject-v2 start");
   console.log("[api.extractSubject] imageUrl =", params.imageUrl);
-  console.log(
-    "[api.extractSubject] point =",
-    { x: params.normalizedX, y: params.normalizedY },
-  );
+  console.log("[api.extractSubject] point =", {
+    x: params.normalizedX,
+    y: params.normalizedY,
+  });
   console.log("[api.extractSubject] region =", params.region);
   console.log("[api.extractSubject] viewerRole =", params.viewerRole);
 
@@ -821,7 +872,10 @@ export async function extractSubject(
     let detail = `HTTP ${res.status}`;
     try {
       const text = await res.text();
-      console.error("[api.extractSubject] backend error body =", text.slice(0, 500));
+      console.error(
+        "[api.extractSubject] backend error body =",
+        text.slice(0, 500),
+      );
       detail = `extractSubject failed ${res.status}: ${text.slice(0, 300)}`;
     } catch (err) {
       console.error("[api.extractSubject] failed to read error body:", err);
@@ -853,7 +907,9 @@ export type EditElderRegionResult = {
 export async function editElderRegion(
   params: EditElderRegionParams,
 ): Promise<EditElderRegionResult> {
-  console.log("[api.editElderRegion] POST /generate-wallpaper/edit-elder-region start");
+  console.log(
+    "[api.editElderRegion] POST /generate-wallpaper/edit-elder-region start",
+  );
   console.log("[api.editElderRegion] baseImageUrl =", params.baseImageUrl);
   console.log("[api.editElderRegion] transcript =", params.transcript);
 
@@ -889,7 +945,10 @@ export async function editElderRegion(
     let detail = `HTTP ${res.status}`;
     try {
       const text = await res.text();
-      console.error("[api.editElderRegion] backend error body =", text.slice(0, 500));
+      console.error(
+        "[api.editElderRegion] backend error body =",
+        text.slice(0, 500),
+      );
       detail = `editElderRegion failed ${res.status}: ${text.slice(0, 300)}`;
     } catch (err) {
       console.error("[api.editElderRegion] failed to read error body:", err);
@@ -901,7 +960,6 @@ export async function editElderRegion(
   console.log("[api.editElderRegion] response json =", json);
   return json;
 }
-
 
 // ---------------------------------------------------------------------------
 // Final WallpaperStage: edit the lower-left SELF region (replaces
@@ -929,7 +987,10 @@ export async function editSelfRegion(
   console.log("[api.editSelfRegion] start");
   console.log("[api.editSelfRegion] baseImageUrl =", params.baseImageUrl);
   console.log("[api.editSelfRegion] viewerRole =", params.viewerRole);
-  console.log("[api.editSelfRegion] speechRecognized =", params.speechRecognized);
+  console.log(
+    "[api.editSelfRegion] speechRecognized =",
+    params.speechRecognized,
+  );
   console.log("[api.editSelfRegion] has selfImage =", !!params.selfImage);
 
   const form = new FormData();
@@ -942,14 +1003,11 @@ export async function editSelfRegion(
     form.append("self_image", params.selfImage, "self.jpg");
   }
 
-  const response = await fetch(
-    apiUrl("/generate-wallpaper/edit-self-region"),
-    {
-      method: "POST",
-      body: form,
-      signal: AbortSignal.timeout(300_000),
-    },
-  );
+  const response = await fetch(apiUrl("/generate-wallpaper/edit-self-region"), {
+    method: "POST",
+    body: form,
+    signal: AbortSignal.timeout(300_000),
+  });
 
   const text = await response.text();
 

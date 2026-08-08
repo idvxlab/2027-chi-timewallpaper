@@ -15,6 +15,7 @@ import { useI18n, formatLongDate, formatSummaryDate } from "@/lib/i18n";
 import {
   createComfortReply,
   getCurrentRelationshipCharacterAssets,
+  recordExperimentEvent,
   resolveApiAssetUrl,
   type CharacterAsset,
   type RelationshipSummary,
@@ -62,7 +63,9 @@ function buildCommunicationSummary(
 ): CommunicationSummary | null {
   if (!relationshipSummary) return null;
   const theme =
-    (language === "zh" ? relationshipSummary.themeZh : relationshipSummary.themeEn) || "";
+    (language === "zh"
+      ? relationshipSummary.themeZh
+      : relationshipSummary.themeEn) || "";
   const description =
     (language === "zh"
       ? relationshipSummary.descriptionZh
@@ -536,9 +539,15 @@ function ConnectionSummaryCard({
   );
 }
 
-function SummaryAbstractCard({ summary }: { summary: CommunicationSummary | null }) {
+function SummaryAbstractCard({
+  summary,
+}: {
+  summary: CommunicationSummary | null;
+}) {
   const { t } = useI18n();
-  const suggestions = (summary?.suggestedReplies ?? []).filter(Boolean).slice(0, 2);
+  const suggestions = (summary?.suggestedReplies ?? [])
+    .filter(Boolean)
+    .slice(0, 2);
   return (
     <section className="mt-[clamp(16px,2.2vh,24px)] shrink-0 rounded-[32px] border border-white/90 bg-white/[0.82] px-[clamp(22px,5vw,34px)] py-[clamp(18px,2.4vh,28px)] text-center shadow-[0_10px_20px_rgba(69,58,48,0.16)] backdrop-blur-md">
       <h2 className="flex items-center justify-center gap-2 text-[clamp(27px,5vw,37px)] font-extrabold leading-tight tracking-[-0.025em] text-black">
@@ -741,7 +750,9 @@ export function ChatOverlay() {
   const [hint, setHint] = useState<string | null>(null);
   const [llmReplies, setLlmReplies] = useState<Record<string, string[]>>({});
   const [replyLoadingKey, setReplyLoadingKey] = useState<string | null>(null);
-  const [replyErrorKeys, setReplyErrorKeys] = useState<Record<string, true>>({});
+  const [replyErrorKeys, setReplyErrorKeys] = useState<Record<string, true>>(
+    {},
+  );
   const [backendPortraits, setBackendPortraits] = useState({
     child: "",
     elder: "",
@@ -817,10 +828,9 @@ export function ChatOverlay() {
     : "";
   const persistedChatbotReplies = Array.from(
     new Set(
-      (
-        replyTarget?.suggestedReplies?.length
-          ? replyTarget.suggestedReplies
-          : [replyTarget?.suggestedReply || ""]
+      (replyTarget?.suggestedReplies?.length
+        ? replyTarget.suggestedReplies
+        : [replyTarget?.suggestedReply || ""]
       )
         .map((reply) => reply.trim())
         .filter(Boolean),
@@ -852,7 +862,8 @@ export function ChatOverlay() {
             (language === "zh" ? "暂无总结" : "No summary yet"),
           visualClues: baseSummary?.visualClues || "",
           suggestedReplies:
-            replyLoadingKey === replyRequestKey && llmReplySuggestions.length < 2
+            replyLoadingKey === replyRequestKey &&
+            llmReplySuggestions.length < 2
               ? [
                   ...llmReplySuggestions,
                   language === "zh"
@@ -924,7 +935,8 @@ export function ChatOverlay() {
         }));
       })
       .catch((error) => {
-        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (error instanceof DOMException && error.name === "AbortError")
+          return;
         console.error("[ChatOverlay] comfort reply failed", error);
         setReplyErrorKeys((current) => ({
           ...current,
@@ -951,6 +963,23 @@ export function ChatOverlay() {
 
   const handleDownloadWallpaper = async () => {
     if (!selectedWallpaperUrl) return;
+
+    const selectedWallpaper = currentDayWallpapers[currentWallpaperIndex];
+    void recordExperimentEvent({
+      eventName: "wallpaper.download_requested",
+      sceneId: selectedWallpaper?.revisionId || "",
+      updateId:
+        selectedWallpaper?.eventSeq === undefined
+          ? ""
+          : String(selectedWallpaper.eventSeq),
+      payload: {
+        imageUrl: selectedWallpaperUrl,
+        dayKey,
+        isDemo: Boolean(selectedWallpaper?.isDemo),
+      },
+    }).catch((error) => {
+      console.warn("[ChatOverlay] download event logging failed", error);
+    });
 
     try {
       const response = await fetch(selectedWallpaperUrl);
