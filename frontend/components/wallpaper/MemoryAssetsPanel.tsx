@@ -40,6 +40,27 @@ export function MemoryAssetsPanel({
       ) : null}
       <div className="pointer-events-none absolute inset-0 bg-[rgba(250,246,238,0.34)]" />
 
+      <button
+        type="button"
+        aria-label={t("memory.close")}
+        onClick={onClose}
+        className="absolute right-[clamp(16px,3.5vw,28px)] top-[clamp(16px,2.5vh,28px)] z-[100] flex h-[56px] w-[56px] items-center justify-center rounded-full bg-white/[0.82] text-black shadow-[0_7px_16px_rgba(58,48,39,0.15)] backdrop-blur-md transition hover:-translate-x-0.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-black active:translate-x-0"
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="h-7 w-7"
+          aria-hidden="true"
+        >
+          <path d="M19 12H5" />
+          <path d="M12 19l-7-7 7-7" />
+        </svg>
+      </button>
+
       <section className="absolute left-1/2 top-[51%] flex h-[76%] w-[86%] max-w-[680px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-[34px] border border-white/90 bg-white/[0.66] px-[clamp(22px,5vw,36px)] pb-[clamp(24px,3.2vh,38px)] pt-[clamp(24px,3.2vh,38px)] shadow-[0_18px_38px_rgba(74,60,47,0.18)] backdrop-blur-md">
         <div
           className="mx-auto h-[6px] w-[76px] rounded-full bg-black/30"

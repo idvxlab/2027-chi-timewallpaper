@@ -125,8 +125,13 @@ export function PetalMotionLayer({
   motionPaused = false,
 }: PetalMotionLayerProps) {
   const uiMode = useSceneStore((state) => state.uiMode);
+  const initialInsertStatus = useSceneStore(
+    (state) => state.initialInsertStatus,
+  );
+  const firstRecordingCompleted =
+    initialInsertStatus === "generating" || initialInsertStatus === "ready";
 
-  if (uiMode !== "wallpaper") return null;
+  if (uiMode !== "wallpaper" || !firstRecordingCompleted) return null;
 
   return (
     <div

@@ -243,53 +243,6 @@ function Portrait({
   );
 }
 
-function NextButton({
-  disabled,
-  isLoading,
-  onClick,
-}: {
-  disabled: boolean;
-  isLoading: boolean;
-  onClick: () => void;
-}) {
-  const { t } = useI18n();
-  return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={onClick}
-      aria-label={isLoading ? t("photo.continueLoading") : t("photo.continue")}
-      className={[
-        "absolute bottom-[clamp(112px,14vh,158px)] left-1/2 z-30 flex h-[82px] w-[82px] -translate-x-1/2 items-center justify-center rounded-full",
-        "text-white shadow-[0_13px_25px_rgba(42,37,32,0.16)] transition duration-200",
-        "focus:outline-none focus-visible:ring-3 focus-visible:ring-black focus-visible:ring-offset-3 focus-visible:ring-offset-[#eee7da]",
-        disabled
-          ? "cursor-not-allowed bg-black/38"
-          : "cursor-pointer bg-black hover:-translate-x-1/2 hover:-translate-y-1 active:translate-y-0",
-      ].join(" ")}
-    >
-      {isLoading ? (
-        <span className="h-7 w-7 animate-spin rounded-full border-[3px] border-white/35 border-t-white" />
-      ) : (
-        <svg
-          aria-hidden="true"
-          viewBox="0 0 52 24"
-          fill="none"
-          className="h-8 w-[48px]"
-        >
-          <path
-            d="M2 12h44M35 2l11 10-11 10"
-            stroke="currentColor"
-            strokeWidth="2.6"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
-      )}
-    </button>
-  );
-}
-
 function CornerControls({
   onBack,
   onOpenSettings,
@@ -621,37 +574,57 @@ export function PhotoUploadScreen() {
 
           <button
             type="button"
-            onClick={handleGenerateButton}
-            disabled={generateDisabled}
+            onClick={canEnter ? () => setStep("connected") : handleGenerateButton}
+            disabled={!canEnter && generateDisabled}
+            aria-label={canEnter ? t("photo.continue") : undefined}
             className={[
               "relative z-10 -mt-[10px] flex min-h-[66px] min-w-[clamp(310px,57vw,420px)] items-center justify-center gap-3 rounded-full bg-black px-8",
               "text-[clamp(24px,4.1vw,31px)] font-semibold text-white shadow-[0_10px_20px_rgba(49,43,36,0.12)] transition",
               "focus:outline-none focus-visible:ring-3 focus-visible:ring-black focus-visible:ring-offset-3 focus-visible:ring-offset-[#eee7da]",
-              generateDisabled
+              !canEnter && generateDisabled
                 ? "cursor-not-allowed opacity-40"
                 : "cursor-pointer hover:-translate-y-0.5 active:translate-y-0",
             ].join(" ")}
           >
-            <svg
-              aria-hidden="true"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              className={[
-                "h-6 w-6 shrink-0",
-                isPortraitGenerating ? "animate-spin" : "",
-              ].join(" ")}
-            >
-              <path d="M20 7h-5V2" />
-              <path d="M4 17h5v5" />
-              <path d="M5.2 9A8 8 0 0 1 18 4.7L20 7" />
-              <path d="M18.8 15A8 8 0 0 1 6 19.3L4 17" />
-            </svg>
+            {canEnter ? (
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 52 24"
+                fill="none"
+                className="h-7 w-11 shrink-0"
+              >
+                <path
+                  d="M2 12h44M35 2l11 10-11 10"
+                  stroke="currentColor"
+                  strokeWidth="2.6"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            ) : (
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className={[
+                  "h-6 w-6 shrink-0",
+                  isPortraitGenerating ? "animate-spin" : "",
+                ].join(" ")}
+              >
+                <path d="M20 7h-5V2" />
+                <path d="M4 17h5v5" />
+                <path d="M5.2 9A8 8 0 0 1 18 4.7L20 7" />
+                <path d="M18.8 15A8 8 0 0 1 6 19.3L4 17" />
+              </svg>
+            )}
             <span>
-              {isPortraitGenerating
+              {canEnter
+                ? t("photo.continue")
+                : isPortraitGenerating
                 ? t("photo.generating")
                 : t("photo.generatePortait")}
             </span>
@@ -695,11 +668,6 @@ export function PhotoUploadScreen() {
         </div>
       </main>
 
-      <NextButton
-        disabled={!canEnter}
-        isLoading={false}
-        onClick={() => setStep("connected")}
-      />
       <ProgressIndicator />
 
       <HiddenPhotoInput

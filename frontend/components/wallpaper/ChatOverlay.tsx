@@ -506,7 +506,7 @@ function ConnectionSummaryCard({
           imageUrl={childPortraitUrl}
           label={t("chat.adultChild")}
         />
-        <p className="text-[clamp(58px,11vw,82px)] font-extrabold leading-none tracking-[-0.055em] text-white">
+        <p className="min-w-0 text-[clamp(38px,8.2vw,62px)] font-extrabold leading-none tracking-[-0.055em] text-white">
           {relationshipTheme || t("chat.hope")}
         </p>
         <SummaryAvatar

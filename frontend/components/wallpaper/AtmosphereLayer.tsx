@@ -133,6 +133,7 @@ export function AtmosphereLayer({
     (state) => state.generatedWallpaperUrl,
   );
   const uiMode = useSceneStore((state) => state.uiMode);
+  const currentDayIndex = useSceneStore((state) => state.currentDayIndex);
   const envelope = useSceneStore((state) => state.wallpaperEnvelope);
   const focusMode = useSceneStore((state) => state.focusMode);
   const setFocusMode = useSceneStore((state) => state.setFocusMode);
@@ -292,7 +293,7 @@ export function AtmosphereLayer({
 
         {/* Clock overlay — outside the focus transform wrapper so it never
             scales or translates when the user switches elder/child focus. */}
-        <WallpaperClockOverlay />
+        <WallpaperClockOverlay dayIndex={currentDayIndex} />
 
         <style jsx>{`
           .pre-wallpaper {

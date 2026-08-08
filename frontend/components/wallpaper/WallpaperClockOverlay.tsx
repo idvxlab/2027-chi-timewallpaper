@@ -8,8 +8,10 @@ type DateParts = {
   timeLine: string;
 };
 
-function formatClock(locale: string): DateParts {
+function formatClock(locale: string, dayIndex: number): DateParts {
   const now = new Date();
+  const displayedDate = new Date(now);
+  displayedDate.setDate(now.getDate() - (2 - dayIndex));
   const dtf = new Intl.DateTimeFormat(locale, {
     weekday: "long",
     month: "long",
@@ -21,12 +23,12 @@ function formatClock(locale: string): DateParts {
     hour12: false,
   });
   return {
-    dateLine: dtf.format(now),
+    dateLine: dtf.format(displayedDate),
     timeLine: tf.format(now),
   };
 }
 
-function useWallpaperClock(language: "zh" | "en") {
+function useWallpaperClock(language: "zh" | "en", dayIndex: number) {
   const locale = language === "zh" ? "zh-CN" : "en-US";
 
   // Start with empty strings to avoid SSR/hydration mismatch.
@@ -38,14 +40,14 @@ function useWallpaperClock(language: "zh" | "en") {
 
   useEffect(() => {
     // Populate immediately on mount.
-    setParts(formatClock(locale));
+    setParts(formatClock(locale, dayIndex));
 
     // Calculate ms until the next minute boundary to avoid drift.
     const now = Date.now();
     const msUntilNextMinute = 60_000 - (now % 60_000);
 
     const scheduleNext = () => {
-      setParts(formatClock(locale));
+      setParts(formatClock(locale, dayIndex));
     };
 
     // intervalId lives in the outer scope so the cleanup function can reach it.
@@ -60,14 +62,14 @@ function useWallpaperClock(language: "zh" | "en") {
       clearTimeout(nextMinuteTimer);
       if (intervalId !== null) clearInterval(intervalId);
     };
-  }, [locale]);
+  }, [dayIndex, locale]);
 
   return parts;
 }
 
-export function WallpaperClockOverlay() {
+export function WallpaperClockOverlay({ dayIndex }: { dayIndex: number }) {
   const { language } = useI18n();
-  const { dateLine, timeLine } = useWallpaperClock(language);
+  const { dateLine, timeLine } = useWallpaperClock(language, dayIndex);
 
   if (!dateLine && !timeLine) {
     return null;
