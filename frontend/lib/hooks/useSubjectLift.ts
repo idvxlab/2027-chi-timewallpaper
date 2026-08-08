@@ -534,6 +534,14 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   const onStartRecordingRef = useRef<
     ((viewerRole: ViewerRole) => Promise<boolean>) | null
   >(null);
+  // Capture-finished callback fired by the recorder hook when the real
+  // MediaRecorder / streaming pipeline actually stopped capture — NOT when
+  // ASR / image generation finished. This is the authoritative signal that
+  // drives Subject Lift's "recording -> releasing" transition, independent
+  // of the voiceStatus store which spans the entire ASR + generation chain.
+  const onCaptureFinishedRef = useRef<
+    ((reason: "user_stop" | "silence" | "no_speech" | "error" | "max") => void) | null
+  >(null);
   // Tracks whether the lift ever reached "recording" so we can tell real
   // recorder stop events apart from startup-phase idle -> recording flips.
   // This ref is mirrored into a tick-based state at the bottom of the hook
@@ -734,15 +742,30 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   }, [clearArmedTimeout, enterReleasing, state.status]);
 
   // ── Reset when lift feature becomes ineligible ────────────────────────
+  // Only collapse an *idle-ish* lift state when canLift flips off. Crucially
+  // we MUST NOT yank the state back to "idle" while we are inside
+  // "starting" or "recording" — those states own the user's active session,
+  // and the voiceStatus store flips to "recording"/"transcribing"/"editing"
+  // for the entire ASR + image-generation chain, which would otherwise
+  // visually kill the lifted subject mid-recording.
   useEffect(() => {
-    if (!canLift) {
-      cancelPress();
-      clearArmedTimeout();
-      extractionResultRef.current = null;
-      firstReleaseDoneRef.current = false;
-      setHasEnteredRecording(false);
-      transitionState({ status: "idle" });
+    if (canLift) return;
+    const current = liftStateRef.current.status;
+    if (
+      current === "starting" ||
+      current === "recording" ||
+      current === "releasing"
+    ) {
+      // Active recording session: leave state alone. The
+      // notifyCaptureFinished bridge is the authoritative release signal.
+      return;
     }
+    cancelPress();
+    clearArmedTimeout();
+    extractionResultRef.current = null;
+    firstReleaseDoneRef.current = false;
+    setHasEnteredRecording(false);
+    transitionState({ status: "idle" });
   }, [canLift, cancelPress, clearArmedTimeout]);
 
   // ── Releasing timeout ────────────────────────────────────────────────
@@ -1331,9 +1354,14 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
 
       hasEnteredRecordingRef.current = true;
       setHasEnteredRecording(true);
+      // Pin a new recording-session sequence id so any stale
+      // capture-finished notification from a previous (now superseded)
+      // recording can be ignored.
+      currentRecordingSeqRef.current = ++startRecordingSeqRef.current;
       console.log("[SUBJECT_LIFT] recording", {
         region: result.region,
         viewerRole,
+        seq: currentRecordingSeqRef.current,
       });
       console.log("[subject_lift_transition]", {
         from: "starting",
@@ -1420,6 +1448,90 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     [state.status, clearArmedTimeout],
   );
 
+  // ── Capture-finished bridge ────────────────────────────────────────────
+  // The recorder hook calls this the moment real audio capture stops
+  // (MediaRecorder.onstop / streaming flush done / fallback to flash / error
+  // path), independent of voiceStatus. This drives the authoritative
+  // "recording -> releasing" transition so the Subject Lift visual never
+  // lingers on the capture-pulse animation while ASR / image generation
+  // continues for 30-60 seconds.
+  //
+  // Behaviour:
+  //   - state.status === "recording": transition to "releasing"
+  //   - state.status === "starting":  roll back to "armed_lifted"
+  //     (capture pipeline ended before it ever became recording — keep the
+  //     visual available for the user to tap again)
+  //   - any other state: no-op (stale callback from an earlier session)
+  //
+  // Concurrent stop protection: a stale capture-finished notification from
+  // a previous recording session (e.g. recorder onerror firing after a new
+  // recording has already started) MUST NOT collapse the new session's
+  // recording state. We compare against the startRecording sequence id.
+  const startRecordingSeqRef = useRef(0);
+  const currentRecordingSeqRef = useRef(0);
+
+  const notifyCaptureFinished = useCallback(
+    (reason: "user_stop" | "silence" | "no_speech" | "error" | "max") => {
+      // No-op when the bridge isn't wired (e.g. tests, or recorder hook
+      // unmounted). The callback is allowed to fire from any code path.
+      if (!onCaptureFinishedRef.current) return;
+      const trigger = `recorder_capture_${reason}`;
+      const currentSeq = currentRecordingSeqRef.current;
+      const result = extractionResultRef.current;
+      console.log(
+        "[SUBJECT_LIFT] capture_finished_notify",
+        { reason, currentSeq },
+      );
+
+      if (liftStateRef.current.status === "recording") {
+        if (!result) {
+          console.log(
+            "[SubjectLift] capture_finished but no extraction result; collapsing to idle",
+          );
+          clearArmedTimeout();
+          hasEnteredRecordingRef.current = false;
+          setHasEnteredRecording(false);
+          transitionState({ status: "idle" });
+          return;
+        }
+        console.log("[SUBJECT_LIFT] releasing", { trigger, currentSeq });
+        console.log("[subject_lift_transition]", {
+          from: "recording",
+          to: "releasing",
+          reason: `capture_finished:${reason}`,
+          sessionId: pressSessionIdRef.current,
+          seq: currentSeq,
+        });
+        console.log(`[subject_lift_release] reason=${trigger} status=recording`);
+        clearArmedTimeout();
+        hasEnteredRecordingRef.current = false;
+        setHasEnteredRecording(false);
+        transitionState({ status: "releasing", ...result });
+        return;
+      }
+      if (liftStateRef.current.status === "starting") {
+        // Capture pipeline ended before recording was promoted. Roll back
+        // so the user can tap again. We deliberately do NOT call
+        // onStopRecordingRef because capture is already done — calling it
+        // would be a no-op anyway.
+        if (result) {
+          console.log(
+            "[SubjectLift] capture_finished while starting; rolling back to armed_lifted",
+            { reason },
+          );
+          transitionState({ status: "armed_lifted", ...result });
+        }
+        return;
+      }
+      // Stale callback (already released, idle, error, or never recorded).
+      console.log(
+        "[SubjectLift] capture_finished ignored (stale)",
+        { reason, status: liftStateRef.current.status, currentSeq },
+      );
+    },
+    [clearArmedTimeout],
+  );
+
   // Allow the layer to install the actual recorder start/stop hooks
   // without re-creating our callbacks. The recorder owns the long-lived
   // MediaRecorder instance.
@@ -1427,9 +1539,15 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     (
       startHook: ((viewerRole: ViewerRole) => Promise<boolean>) | null,
       stopHook: (() => void) | null,
+      captureFinishedHook:
+        | ((
+            reason: "user_stop" | "silence" | "no_speech" | "error" | "max",
+          ) => void)
+        | null = null,
     ) => {
       onStartRecordingRef.current = startHook;
       onStopRecordingRef.current = stopHook;
+      onCaptureFinishedRef.current = captureFinishedHook;
     },
     [],
   );
@@ -1456,6 +1574,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     startRecording,
     stopRecording,
     registerRecorderBridge,
+    notifyCaptureFinished,
     hasEnteredRecording: getHasEnteredRecording(),
     handlers: {
       onPointerDown,

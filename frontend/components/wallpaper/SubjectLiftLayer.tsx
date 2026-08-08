@@ -106,6 +106,7 @@ export function SubjectLiftLayer({
     startRecording,
     stopRecording,
     registerRecorderBridge,
+    notifyCaptureFinished,
     hasEnteredRecording,
   } = useSubjectLift({ imageSize, focusMode });
   const interactionActive =
@@ -122,8 +123,12 @@ export function SubjectLiftLayer({
     role === "elder" ? "elder" : "child";
 
   // ── Recorder ───────────────────────────────────────────────────────
-  const { status: voiceStatus, start: recorderStart, finishRecording: recorderStop } =
-    useWallpaperVoiceEditRecorder();
+  const {
+    status: voiceStatus,
+    start: recorderStart,
+    finishRecording: recorderStop,
+    subscribeCaptureFinished,
+  } = useWallpaperVoiceEditRecorder();
 
   // Wire recorder hooks into the subject-lift hook so it can fire them.
   // The bridge contract is Promise<boolean>: true only after the underlying
@@ -140,6 +145,23 @@ export function SubjectLiftLayer({
       },
     );
   }, [registerRecorderBridge, recorderStart, recorderStop]);
+
+  // Subscribe to the recorder hook's authoritative "real audio capture
+  // stopped" event. This fires the instant MediaRecorder.stop() is
+  // invoked (or the equivalent streaming path), regardless of voiceStatus.
+  // Subject Lift uses this as the single source of truth for transitioning
+  // recording -> releasing — independent of ASR / image-generation, which
+  // can take 30-60s on mobile after capture has already ended.
+  useEffect(() => {
+    const unsubscribe = subscribeCaptureFinished((reason) => {
+      console.log(
+        "[SubjectLiftLayer] capture_finished_from_recorder",
+        { reason },
+      );
+      notifyCaptureFinished(reason);
+    });
+    return () => unsubscribe();
+  }, [subscribeCaptureFinished, notifyCaptureFinished]);
 
   // ── Container bounding rect ────────────────────────────────────────
   const containerRef = useRef<HTMLDivElement | null>(null);

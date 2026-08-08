@@ -166,6 +166,36 @@ export function useWallpaperVoiceEditRecorder() {
   const requestIdRef = useRef("");
   const activeSourceRef = useRef<RecorderSource>("subject_lift");
 
+  // External listeners (e.g. Subject Lift) that want to know the exact
+  // moment real audio capture stops. We fire on user stop, silence auto
+  // stop, no-speech timeout, max-duration timeout, recorder onerror, and
+  // flash fallback. The listeners run BEFORE the asynchronous ASR /
+  // voice edit / image generation pipeline, so consumers can release
+  // any visual state that should NOT persist across the full task.
+  const captureFinishedListenersRef = useRef<
+    Set<(reason: "user_stop" | "silence" | "no_speech" | "error" | "max") => void>
+  >(new Set());
+
+  const emitCaptureFinished = useCallback(
+    (reason: "user_stop" | "silence" | "no_speech" | "error" | "max") => {
+      const listeners = captureFinishedListenersRef.current;
+      if (!listeners.size) return;
+      // Copy to a snapshot so listeners can unsubscribe during iteration.
+      const snapshot = Array.from(listeners);
+      for (const listener of snapshot) {
+        try {
+          listener(reason);
+        } catch (err) {
+          console.error(
+            "[VOICE] captureFinished listener threw",
+            err,
+          );
+        }
+      }
+    },
+    [],
+  );
+
   const clearTimers = useCallback(() => {
     if (timerRef.current !== null) window.clearInterval(timerRef.current);
     if (maxTimerRef.current !== null) window.clearTimeout(maxTimerRef.current);
@@ -315,69 +345,97 @@ export function useWallpaperVoiceEditRecorder() {
     }
   }, []);
 
-  const finishStreamingRecording = useCallback(() => {
-    if (endingRef.current || streamFinishedRef.current) return;
-    endingRef.current = true;
-    console.log("[VOICE] stop_requested reason=stream_finish");
-    clearTimers();
-    cleanupStreamingAudio();
-    flushStreamingPacket(true);
-    setElapsedSec(0);
+  const finishStreamingRecording = useCallback(
+    (reason: "user_stop" | "silence" | "no_speech" | "max" | "error" = "user_stop") => {
+      if (endingRef.current || streamFinishedRef.current) return;
+      endingRef.current = true;
+      console.log("[VOICE] stop_requested reason=stream_finish", { reason });
+      // Notify capture-finished listeners BEFORE we tear down the audio
+      // graph / socket, so the Subject Lift visual can transition to
+      // releasing immediately rather than waiting on the ASR / image
+      // generation pipeline (which can take 30-60s on mobile).
+      emitCaptureFinished(reason);
+      clearTimers();
+      cleanupStreamingAudio();
+      flushStreamingPacket(true);
+      setElapsedSec(0);
 
-    const durationMs = Date.now() - startedAtRef.current;
-    const profile = VOICE_PROFILES[viewerRoleRef.current];
-    const socket = streamSocketRef.current;
-    if (
-      !socket ||
-      socket.readyState !== WebSocket.OPEN ||
-      durationMs < profile.minSpeechMs ||
-      allPcmRef.current.length === 0
-    ) {
-      if (socket?.readyState === WebSocket.OPEN)
-        socket.send(JSON.stringify({ type: "cancel" }));
-      closeStreamSocket();
-      isBusyRef.current = false;
-      setStatus("idle");
-      return;
-    }
-    socket.send(JSON.stringify({ type: "end" }));
-    setStatus("transcribing");
-    console.log("[VOICE] recorder_stopped", {
-      mode: "stream",
-      durationMs,
-      reason: "user_or_silence",
-    });
-  }, [clearTimers, cleanupStreamingAudio, closeStreamSocket, flushStreamingPacket, setStatus]);
-
-  const finishFlashRecording = useCallback(() => {
-    const recorder = mediaRecorderRef.current;
-    if (!recorder || recorder.state === "inactive") return;
-    console.log("[VOICE] stop_requested reason=flash_finish");
-    clearTimers();
-    const durationMs = Date.now() - startedAtRef.current;
-    setElapsedSec(0);
-    recorder.onstop = () => {
-      recorder.stream.getTracks().forEach((track) => track.stop());
-      const blob = new Blob(flashChunksRef.current, {
-        type: recorder.mimeType || "audio/webm",
+      const durationMs = Date.now() - startedAtRef.current;
+      const profile = VOICE_PROFILES[viewerRoleRef.current];
+      const socket = streamSocketRef.current;
+      if (
+        !socket ||
+        socket.readyState !== WebSocket.OPEN ||
+        durationMs < profile.minSpeechMs ||
+        allPcmRef.current.length === 0
+      ) {
+        if (socket?.readyState === WebSocket.OPEN)
+          socket.send(JSON.stringify({ type: "cancel" }));
+        closeStreamSocket();
+        isBusyRef.current = false;
+        setStatus("idle");
+        return;
+      }
+      socket.send(JSON.stringify({ type: "end" }));
+      setStatus("transcribing");
+      console.log("[VOICE] recorder_stopped", {
+        mode: "stream",
+        durationMs,
+        reason,
       });
-      flashChunksRef.current = [];
-      mediaRecorderRef.current = null;
-      void processFlashRecording(blob, durationMs);
-    };
-    try {
-      recorder.requestData?.();
-    } catch (error) {
-      console.warn("[WallpaperVoiceEdit] requestData failed", error);
-    }
-    recorder.stop();
-    setStatus("transcribing");
-    console.log("[VOICE] recorder_stopped", {
-      mode: "flash",
-      durationMs,
-      reason: "user_or_silence",
-    });
-  }, [clearTimers, processFlashRecording, setStatus]);
+    },
+    [
+      clearTimers,
+      cleanupStreamingAudio,
+      closeStreamSocket,
+      emitCaptureFinished,
+      flushStreamingPacket,
+      setStatus,
+    ],
+  );
+
+  const finishFlashRecording = useCallback(
+    (reason: "user_stop" | "silence" | "no_speech" | "max" | "error" = "user_stop") => {
+      const recorder = mediaRecorderRef.current;
+      if (!recorder || recorder.state === "inactive") {
+        // Already inactive: still notify so any visual state can collapse.
+        emitCaptureFinished(reason);
+        return;
+      }
+      console.log("[VOICE] stop_requested reason=flash_finish", { reason });
+      // Notify capture-finished listeners synchronously so Subject Lift
+      // can transition to releasing the moment MediaRecorder.stop() is
+      // invoked. We deliberately do NOT wait for the async onstop —
+      // otherwise the Subject Lift visual would persist until the
+      // ASR / image-generation pipeline completes.
+      emitCaptureFinished(reason);
+      clearTimers();
+      const durationMs = Date.now() - startedAtRef.current;
+      setElapsedSec(0);
+      recorder.onstop = () => {
+        recorder.stream.getTracks().forEach((track) => track.stop());
+        const blob = new Blob(flashChunksRef.current, {
+          type: recorder.mimeType || "audio/webm",
+        });
+        flashChunksRef.current = [];
+        mediaRecorderRef.current = null;
+        void processFlashRecording(blob, durationMs);
+      };
+      try {
+        recorder.requestData?.();
+      } catch (error) {
+        console.warn("[WallpaperVoiceEdit] requestData failed", error);
+      }
+      recorder.stop();
+      setStatus("transcribing");
+      console.log("[VOICE] recorder_stopped", {
+        mode: "flash",
+        durationMs,
+        reason,
+      });
+    },
+    [clearTimers, emitCaptureFinished, processFlashRecording, setStatus],
+  );
 
   const startFlashRecording = useCallback(
     async (stream: MediaStream) => {
@@ -393,6 +451,7 @@ export function useWallpaperVoiceEditRecorder() {
       };
       recorder.onerror = (event) => {
         console.error("[WallpaperVoiceEdit] MediaRecorder error", event);
+        emitCaptureFinished("error");
         clearTimers();
         stream.getTracks().forEach((track) => track.stop());
         mediaRecorderRef.current = null;
@@ -402,7 +461,7 @@ export function useWallpaperVoiceEditRecorder() {
       };
       recorder.start(STREAM_CHUNK_MS);
     },
-    [clearTimers, setStatus],
+    [clearTimers, emitCaptureFinished, setStatus],
   );
 
   const startStreamingRecording = useCallback(
@@ -456,6 +515,9 @@ export function useWallpaperVoiceEditRecorder() {
           } else if (message.type === "error") {
             window.clearTimeout(timeout);
             const detail = message.detail || "streaming ASR failed";
+            // Notify capture-finished listeners: capture has stopped (or
+            // never really started) regardless of which branch below runs.
+            emitCaptureFinished("error");
             if (
               message.fallbackAllowed !== false &&
               !streamAsrFinalRef.current &&
@@ -477,6 +539,11 @@ export function useWallpaperVoiceEditRecorder() {
         };
         socket.onerror = () => {
           window.clearTimeout(timeout);
+          // Streaming transport error during capture: the audio pipeline
+          // is gone, so emit capture-finished synchronously. The outer
+          // catch in startRecording() will then either fall back to flash
+          // (if no PCM was captured yet) or report failure.
+          emitCaptureFinished("error");
           reject(new Error("streaming ASR WebSocket failed"));
         };
         socket.onclose = () => {
@@ -559,7 +626,7 @@ export function useWallpaperVoiceEditRecorder() {
               reason: "silence",
               adaptiveMs: adaptiveEndSilenceRef.current,
             });
-            finishStreamingRecording();
+            finishStreamingRecording("silence");
           } else if (
             speechStartedAtRef.current &&
             Date.now() - actualRecorderReadyAtRef.current >= MIN_RECORDING_MS &&
@@ -742,12 +809,12 @@ export function useWallpaperVoiceEditRecorder() {
         setElapsedSec(Math.round((Date.now() - startedAtRef.current) / 1000));
       }, 200);
       maxTimerRef.current = window.setTimeout(() => {
-        if (activeMode === "stream") finishStreamingRecording();
-        else finishFlashRecording();
+        if (activeMode === "stream") finishStreamingRecording("max");
+        else finishFlashRecording("max");
       }, profile.maxRecordingMs);
       if (activeMode === "stream") {
         noSpeechTimerRef.current = window.setTimeout(() => {
-          if (!speechStartedAtRef.current) finishStreamingRecording();
+          if (!speechStartedAtRef.current) finishStreamingRecording("no_speech");
         }, profile.noSpeechTimeoutMs);
       }
       return true;
@@ -766,8 +833,8 @@ export function useWallpaperVoiceEditRecorder() {
 
   const finishRecording = useCallback(() => {
     console.log("[VOICE] stop_requested reason=user_or_layer");
-    if (streamSocketRef.current) finishStreamingRecording();
-    else finishFlashRecording();
+    if (streamSocketRef.current) finishStreamingRecording("user_stop");
+    else finishFlashRecording("user_stop");
   }, [finishFlashRecording, finishStreamingRecording]);
 
   const toggle = useCallback(
@@ -827,6 +894,20 @@ export function useWallpaperVoiceEditRecorder() {
     };
   }, [clearTimers, cleanupStreamingAudio, closeStreamSocket]);
 
+  const subscribeCaptureFinished = useCallback(
+    (
+      listener: (
+        reason: "user_stop" | "silence" | "no_speech" | "error" | "max",
+      ) => void,
+    ): (() => void) => {
+      captureFinishedListenersRef.current.add(listener);
+      return () => {
+        captureFinishedListenersRef.current.delete(listener);
+      };
+    },
+    [],
+  );
+
   return {
     status,
     mode,
@@ -835,6 +916,7 @@ export function useWallpaperVoiceEditRecorder() {
     toggle,
     start,
     finishRecording,
+    subscribeCaptureFinished,
   };
 }
 

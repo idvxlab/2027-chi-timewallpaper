@@ -681,14 +681,6 @@ export function PhotoUploadScreen() {
           ) : null}
         </div>
 
-        <div className="absolute inset-x-0 top-[61%] whitespace-nowrap px-[clamp(28px,7vw,60px)] text-center text-[clamp(24px,4.1vw,31px)] font-medium leading-none text-black/42">
-          {partnerIsReady ? (
-            <span>{t("photo.otherReady")}</span>
-          ) : (
-            <span>{t("photo.otherWaiting")}</span>
-          )}
-        </div>
-
         <div className="absolute inset-x-[clamp(28px,7vw,58px)] bottom-[clamp(206px,24vh,266px)] text-center">
           {uploadError ? (
             <p className="text-[clamp(18px,3vw,23px)] font-semibold leading-snug text-[#8d382d]">
