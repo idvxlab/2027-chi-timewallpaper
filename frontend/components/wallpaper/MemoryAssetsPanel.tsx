@@ -44,7 +44,7 @@ export function MemoryAssetsPanel({
         type="button"
         aria-label={t("memory.close")}
         onClick={onClose}
-        className="absolute right-[clamp(16px,3.5vw,28px)] top-[clamp(16px,2.5vh,28px)] z-[100] flex h-[56px] w-[56px] items-center justify-center rounded-full bg-white/[0.82] text-black shadow-[0_7px_16px_rgba(58,48,39,0.15)] backdrop-blur-md transition hover:-translate-x-0.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-black active:translate-x-0"
+        className="absolute left-[clamp(16px,3.5vw,28px)] top-[clamp(16px,2.5vh,28px)] z-[100] flex h-[56px] w-[56px] items-center justify-center rounded-full bg-white/[0.82] text-black shadow-[0_7px_16px_rgba(58,48,39,0.15)] backdrop-blur-md transition hover:-translate-x-0.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-black active:translate-x-0"
       >
         <svg
           viewBox="0 0 24 24"
