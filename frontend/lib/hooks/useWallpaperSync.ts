@@ -55,22 +55,28 @@ export function useWallpaperSync() {
         scene.setWallpaperRevisions(normalizedHistory);
         scene.setWallpaperInteractions(interactions.items);
 
+        // The revision write above may replace dated buckets and selection.
+        // Re-read state before comparing the independently authoritative
+        // current URL/version; the earlier snapshot is intentionally stale.
+        const refreshedScene = useSceneStore.getState();
+
         // 2. Current wallpaper URL / version (active stage only)
         const hasActiveWallpaper =
           current.stage === "wallpaper_active" &&
           !!currentWallpaperUrl;
         const hasDisplayWallpaper = !!currentWallpaperUrl;
-        const versionAdvanced = current.version > scene.wallpaperVersion;
+        const versionAdvanced =
+          current.version > refreshedScene.wallpaperVersion;
 
         if (hasDisplayWallpaper) {
           const hasStaleUrl =
-            currentWallpaperUrl !== scene.generatedWallpaperUrl;
+            currentWallpaperUrl !== refreshedScene.generatedWallpaperUrl;
           if (versionAdvanced || hasStaleUrl) {
-            scene.setGeneratedWallpaperUrl(currentWallpaperUrl);
+            refreshedScene.setGeneratedWallpaperUrl(currentWallpaperUrl);
           }
         }
         if (hasActiveWallpaper) {
-          scene.setWallpaperVersion(current.version);
+          refreshedScene.setWallpaperVersion(current.version);
           if (versionAdvanced && current.status === "idle") {
             setWallpaperVoiceEditStatus("idle");
           }
@@ -78,17 +84,17 @@ export function useWallpaperSync() {
 
         // 3. Backend stage → initialInsertStatus
         if (hasActiveWallpaper) {
-          scene.setInitialInsertStatus("ready");
+          refreshedScene.setInitialInsertStatus("ready");
         } else if (
           current.stage === "characters_ready" ||
           current.stage === "awaiting_characters"
         ) {
-          scene.setInitialInsertStatus("idle");
+          refreshedScene.setInitialInsertStatus("idle");
         }
 
         // 4. Finally lift the hydration gate — only now is the store
         //    fully consistent for a single refresh.
-        scene.setWallpaperStateHydrated(true);
+        refreshedScene.setWallpaperStateHydrated(true);
       } catch (error) {
         console.debug("[WallpaperSync] refresh skipped", error);
         // Do NOT set hydrated on failure — keep interactionMode in

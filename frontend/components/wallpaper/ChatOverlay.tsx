@@ -827,7 +827,7 @@ export function ChatOverlay() {
   ).slice(0, 2);
   const selectedWallpaperUrl =
     currentDayWallpapers[currentWallpaperIndex]?.imageUrl ||
-    generatedWallpaperUrl ||
+    (isLatest ? generatedWallpaperUrl : "") ||
     "";
   const relationshipSummary =
     currentDayWallpapers[currentWallpaperIndex]?.relationshipSummary ||

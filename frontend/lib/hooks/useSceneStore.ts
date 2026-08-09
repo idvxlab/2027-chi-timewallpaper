@@ -199,9 +199,10 @@ export function getSelectedWallpaper(
 }
 
 export function isLatestWallpaper(state: WallpaperSelectionState): boolean {
+  const todayCount = state.wallpapersByDay.今天.length;
   return (
     state.currentDayIndex === 2 &&
-    state.currentWallpaperIndex === state.wallpapersByDay.今天.length - 1
+    (todayCount === 0 || state.currentWallpaperIndex === todayCount - 1)
   );
 }
 
@@ -383,12 +384,11 @@ export const useSceneStore = create<State>((set, get) => ({
       }
     }
 
-    // Build grouped: start with existing wallpapers and merge real items in
-    const grouped: WallpapersByDay = {
-      前天: realItems.前天.length > 0 ? realItems.前天 : previous.wallpapersByDay.前天,
-      昨天: realItems.昨天.length > 0 ? realItems.昨天 : previous.wallpapersByDay.昨天,
-      今天: realItems.今天.length > 0 ? realItems.今天 : previous.wallpapersByDay.今天,
-    };
+    // Revisions are the only source of truth for dated history. In particular,
+    // an empty day from the backend must clear an older client-side bucket;
+    // otherwise a newly generated current image can leak into yesterday or
+    // the day-before through stale state retained by the speaking device.
+    const grouped: WallpapersByDay = realItems;
 
     let nextDayIndex = previous.currentDayIndex;
     let nextWallpaperIndex = previous.currentWallpaperIndex;
@@ -407,24 +407,17 @@ export const useSceneStore = create<State>((set, get) => ({
         }
       }
     }
-    nextWallpaperIndex = Math.min(
-      nextWallpaperIndex,
-      grouped[DAY_LABELS[nextDayIndex]].length - 1,
+    const selectedDayItems = grouped[DAY_LABELS[nextDayIndex]];
+    nextWallpaperIndex = Math.max(
+      0,
+      Math.min(nextWallpaperIndex, selectedDayItems.length - 1),
     );
 
-    const latestRevision = filteredItems[filteredItems.length - 1];
-    const isValidRevisionUrl =
-      latestRevision?.imageUrl &&
-      latestRevision.imageUrl !== LEGACY_DEMO_WALLPAPER;
-    const nextGeneratedUrl = isValidRevisionUrl
-      ? latestRevision.imageUrl
-      : previous.generatedWallpaperUrl;
     set({
       wallpapersByDay: grouped,
       messagesByDay: syncedMessages,
       currentDayIndex: nextDayIndex,
-      currentWallpaperIndex: Math.max(0, nextWallpaperIndex),
-      generatedWallpaperUrl: nextGeneratedUrl,
+      currentWallpaperIndex: nextWallpaperIndex,
     });
   },
 
@@ -503,7 +496,10 @@ export const useSceneStore = create<State>((set, get) => ({
         wallpaperIndex -= 1;
       } else if (dayIndex > 0) {
         dayIndex -= 1;
-        wallpaperIndex = state.wallpapersByDay[DAY_LABELS[dayIndex]].length - 1;
+        wallpaperIndex = Math.max(
+          0,
+          state.wallpapersByDay[DAY_LABELS[dayIndex]].length - 1,
+        );
       }
     } else if (wallpaperIndex < currentItems.length - 1) {
       wallpaperIndex += 1;
@@ -522,33 +518,10 @@ export const useSceneStore = create<State>((set, get) => ({
   generatedWallpaperUrl: "",
   setGeneratedWallpaperUrl(url: string) {
     if (!url) return;
-    const state = get();
-    const wasLatest = isLatestWallpaper(state);
-    const existingIndex = state.wallpapersByDay.今天.findIndex(
-      (item) => item.imageUrl === url,
-    );
-    if (existingIndex >= 0) {
-      set({ generatedWallpaperUrl: url });
-      return;
-    }
-
-    const nextItem: WallpaperItem = {
-      revisionId: `live-${Date.now()}`,
-      eventSeq: Math.max(0, state.wallpaperVersion),
-      imageUrl: url,
-      createdAt: new Date().toISOString(),
-    };
-    const today =
-      state.wallpapersByDay.今天.length === 0
-        ? [nextItem]
-        : [...state.wallpapersByDay.今天, nextItem];
-    set({
-      generatedWallpaperUrl: url,
-      wallpapersByDay: { ...state.wallpapersByDay, 今天: today },
-      ...(wasLatest
-        ? { currentDayIndex: 2, currentWallpaperIndex: today.length - 1 }
-        : {}),
-    });
+    // The current display URL is not a dated revision. History is populated
+    // exclusively by setWallpaperRevisions after the backend has persisted
+    // the new revision, so never synthesize a local `live-*` history item.
+    set({ generatedWallpaperUrl: url });
   },
   wallpaperVersion: 0,
   setWallpaperVersion(version) {
