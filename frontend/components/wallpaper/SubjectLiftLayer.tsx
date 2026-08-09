@@ -41,6 +41,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { normalizeWallpaperImageUrl } from "@/lib/api";
 import { imageBBoxToClientRect, _setAlphaMask } from "@/lib/subjectGeometry";
 import { getAlphaRingMarkup } from "@/lib/hooks/subjectAlphaRing";
 import {
@@ -81,11 +82,15 @@ export function SubjectLiftLayer({
   const activeWallpaperUrl = useSceneStore(
     (s) => getSelectedWallpaper(s)?.imageUrl || "",
   );
+  const activeWallpaperDisplayUrl = useMemo(
+    () => normalizeWallpaperImageUrl(activeWallpaperUrl),
+    [activeWallpaperUrl],
+  );
   const focusMode = useSceneStore((s) => s.focusMode);
   const [imageSize, setImageSize] = useState<NaturalSize | null>(null);
 
   useEffect(() => {
-    if (!activeWallpaperUrl) {
+    if (!activeWallpaperDisplayUrl) {
       setImageSize(null);
       return;
     }
@@ -93,8 +98,8 @@ export function SubjectLiftLayer({
     img.onload = () =>
       setImageSize({ width: img.naturalWidth, height: img.naturalHeight });
     img.onerror = () => setImageSize(null);
-    img.src = activeWallpaperUrl;
-  }, [activeWallpaperUrl]);
+    img.src = activeWallpaperDisplayUrl;
+  }, [activeWallpaperDisplayUrl]);
 
   // ── Subject lift hook ────────────────────────────────────────────────
   const {
@@ -618,6 +623,8 @@ function LiftedSubjectVisual({
   }) => void;
   onError: () => void;
 }) {
+  const resolvedCutoutUrl = normalizeWallpaperImageUrl(displayed.cutoutUrl);
+
   // Convert bbox from source image coordinates to screen coordinates
   const screen = imageBBoxToClientRect({
     bbox: displayed.bbox,
@@ -645,9 +652,9 @@ function LiftedSubjectVisual({
   // from transparent background. Runs once per cutoutUrl.
   const maskBuiltRef = useRef<string | null>(null);
   useEffect(() => {
-    if (maskBuiltRef.current === displayed.cutoutUrl) return;
-    if (!displayed.cutoutUrl) return;
-    const targetUrl = displayed.cutoutUrl;
+    if (maskBuiltRef.current === resolvedCutoutUrl) return;
+    if (!resolvedCutoutUrl) return;
+    const targetUrl = resolvedCutoutUrl;
     const img = new window.Image();
     img.crossOrigin = "anonymous";
     img.onload = () => {
@@ -687,9 +694,9 @@ function LiftedSubjectVisual({
     img.onerror = () => {
       // Best-effort; fall back to bbox-only hit-test.
     };
-    img.src = displayed.cutoutUrl;
+    img.src = resolvedCutoutUrl;
   }, [
-    displayed.cutoutUrl,
+    resolvedCutoutUrl,
     displayed.bbox,
     containerRect,
     naturalSize.width,
@@ -698,8 +705,8 @@ function LiftedSubjectVisual({
   ]);
 
   const { markup: innerMarkup } = useMemo(
-    () => getAlphaRingMarkup(displayed.cutoutUrl, width, height),
-    [displayed.cutoutUrl, width, height],
+    () => getAlphaRingMarkup(resolvedCutoutUrl, width, height),
+    [resolvedCutoutUrl, width, height],
   );
 
   // ── Layered transforms ──────────────────────────────────────────────
@@ -815,7 +822,7 @@ function LiftedSubjectVisual({
             />
             {/* Actual cutout image */}
             <img
-              src={displayed.cutoutUrl}
+              src={resolvedCutoutUrl}
               alt="Lifted subject"
               onError={onError}
               style={{
