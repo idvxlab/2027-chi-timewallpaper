@@ -371,7 +371,7 @@ export function AtmosphereLayer({
                   ? t("atmosphere.returnFull")
                   : t("atmosphere.enlargeUpper")
               }
-              className="right-20 top-24"
+              className="left-2 top-2"
               onClick={() =>
                 setFocusMode(childIsFocused ? "balanced" : "child")
               }
@@ -384,7 +384,7 @@ export function AtmosphereLayer({
                   ? t("atmosphere.returnFull")
                   : t("atmosphere.enlargeLower")
               }
-              className="bottom-6 left-6"
+              className="bottom-2 left-2"
               onClick={() =>
                 setFocusMode(elderIsFocused ? "balanced" : "elder")
               }

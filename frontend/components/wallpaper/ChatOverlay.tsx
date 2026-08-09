@@ -1002,7 +1002,7 @@ export function ChatOverlay() {
   // ── AI Summary page (back side) ──────────────────────────────────────
   if (isWhite) {
     return (
-      <div className="absolute inset-0 z-[80] overflow-hidden bg-[#f3ede2] text-black">
+      <div className="absolute inset-0 z-[80] overflow-y-auto overscroll-y-contain bg-[#f3ede2] text-black [-webkit-overflow-scrolling:touch]">
         {selectedWallpaperUrl ? (
           <div
             aria-hidden="true"
@@ -1072,15 +1072,15 @@ export function ChatOverlay() {
           </svg>
         </button>
 
-        <div className="relative z-10 flex h-full flex-col overflow-hidden px-[clamp(20px,4.5vw,34px)] pb-[clamp(18px,2.8vh,30px)] pt-[clamp(30px,4.2vh,52px)]">
-          <header className="shrink-0 px-[58px] text-center">
-            <h1 className="text-[clamp(34px,6.2vw,48px)] font-extrabold leading-tight tracking-[-0.035em] text-[#4d4135]">
+        <div className="relative z-10 flex min-h-full flex-col px-[clamp(20px,4.5vw,34px)] pb-[clamp(24px,3.2vh,38px)] pt-[clamp(30px,4.2vh,52px)]">
+          <header className="shrink-0 px-[52px] text-center">
+            <h1 className="whitespace-nowrap text-[clamp(24px,4.8vw,38px)] font-extrabold leading-[1.08] tracking-[-0.035em] text-[#4d4135]">
               {formatSummaryDate(currentDayIndex, locale)}
             </h1>
             <div className="mx-auto mt-3 h-[4px] w-[82%] rounded-full bg-black/60" />
           </header>
 
-          <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex flex-col">
             <ConnectionSummaryCard
               summary={displaySummary}
               relationshipTheme={relationshipTheme}

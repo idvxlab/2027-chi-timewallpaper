@@ -176,7 +176,7 @@ export function WallpaperStage() {
           type="button"
           aria-label={t("wallpaperStage.openRecentMemory")}
           onClick={() => setShowAssets(true)}
-          className="absolute left-0 right-20 top-0 z-[70] h-10 bg-transparent"
+          className="absolute left-20 right-20 top-0 z-[70] h-10 bg-transparent"
         />
       ) : null}
 
