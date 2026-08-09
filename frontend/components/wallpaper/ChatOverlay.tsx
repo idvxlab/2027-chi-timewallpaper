@@ -1135,10 +1135,10 @@ export function ChatOverlay() {
         </>
       )}
 
-      {/* Top-right flip toggle */}
+      {/* Top-left flip toggle; the upper focus/zoom control occupies top-right. */}
       <button
         onClick={toggleUiMode}
-        className="absolute right-0 top-0 z-50 h-20 w-20 bg-transparent"
+        className="absolute left-0 top-0 z-50 h-20 w-20 bg-transparent"
         aria-label={
           isWhite ? t("chat.backToWallpaper") : t("chat.openSuggestions")
         }

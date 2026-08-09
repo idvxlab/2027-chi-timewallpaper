@@ -371,7 +371,7 @@ export function AtmosphereLayer({
                   ? t("atmosphere.returnFull")
                   : t("atmosphere.enlargeUpper")
               }
-              className="left-2 top-2"
+              className="right-2 top-2"
               onClick={() =>
                 setFocusMode(childIsFocused ? "balanced" : "child")
               }
