@@ -235,7 +235,9 @@ export function normalizeWallpaperImageUrl(path: string): string {
 
   return LEGACY_BASE_SCENE_PATHS.has(pathname)
     ? resolveApiAssetUrl(STATIC_BASE_SCENE_PATH)
-    : value;
+    : pathname.startsWith("/generated/")
+      ? resolveApiAssetUrl(value)
+      : value;
 }
 
 export async function uploadMyCharacterAsset(

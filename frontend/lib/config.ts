@@ -149,6 +149,17 @@ export function assetUrl(path: string): string {
     return path;
   }
 
+  // Images written by this backend always live below /generated/. Database
+  // rows may contain the public production origin, but the same frontend can
+  // also be reached through another origin while deploying or testing. Keep
+  // these backend-owned assets same-origin so an unreachable stored hostname
+  // cannot turn an otherwise valid wallpaper into a black screen.
+  if (parsed.pathname.startsWith("/generated/")) {
+    const localPath = parsed.pathname + parsed.search + parsed.hash;
+    const backendOrigin = getConfiguredBackendOrigin();
+    return backendOrigin ? backendOrigin + localPath : localPath;
+  }
+
   // Local host? Resolve to the configured backend origin in dev, or
   // collapse to relative in production. This normalizes the case where
   // DB rows contain `http://localhost:8000/...` but the operator
