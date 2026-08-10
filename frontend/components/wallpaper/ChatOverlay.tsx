@@ -515,7 +515,7 @@ function ConnectionSummaryCard({
         />
       </div>
 
-      <p className="mx-auto mt-4 line-clamp-2 max-w-[520px] text-[clamp(22px,3.8vw,29px)] font-semibold leading-[1.35] text-white">
+      <p className="mx-auto mt-4 max-w-[520px] text-[clamp(22px,3.8vw,29px)] font-semibold leading-[1.35] text-white">
         {relationshipDescription || summary?.stateOneLiner || ""}
       </p>
     </section>
