@@ -37,13 +37,24 @@ export type NewMessage =
   | Omit<VoiceMessage, "id" | "timestamp">
   | Omit<TextMessage, "id" | "timestamp">;
 
-export type MessagesByDay = {
-  前天: Message[];
-  昨天: Message[];
-  今天: Message[];
-};
+/**
+ * 7-day rolling window for wallpaper history.
+ * index 0 = 6 days ago, index 6 = today.
+ */
+export const DAY_LABELS = [
+  "6天前",
+  "5天前",
+  "4天前",
+  "3天前",
+  "前天",
+  "昨天",
+  "今天",
+] as const;
 
-export type DayLabel = keyof MessagesByDay;
+export type DayLabel = (typeof DAY_LABELS)[number];
+export const TODAY_INDEX = DAY_LABELS.length - 1; // 6
+
+export type MessagesByDay = Record<DayLabel, Message[]>;
 
 export type WallpaperItem = {
   revisionId: string;
@@ -80,17 +91,16 @@ export type UiMode = "wallpaper" | "white";
 // "child" bias the framing toward one of the two figures.
 export type FocusMode = "balanced" | "elder" | "child";
 
-export const DAY_LABELS: DayLabel[] = ["前天", "昨天", "今天"];
 const STORAGE_KEY = "wallpaper_chat_history";
 
 /** Returns a "M/D" string for a given day index.
- *  0 = day-before  → today - 2
- *  1 = yesterday  → today - 1
- *  2 = today      → today */
+ *  0 = 6 days ago
+ *  ...
+ *  TODAY_INDEX (6) = today */
 export function formatDayLabel(dayIndex: number): string {
   const today = new Date();
   const target = new Date(today);
-  target.setDate(today.getDate() - (2 - dayIndex));
+  target.setDate(today.getDate() - (TODAY_INDEX - dayIndex));
   return `${target.getMonth() + 1}/${target.getDate()}`;
 }
 
@@ -99,11 +109,15 @@ function uid() {
 }
 
 function blank(): MessagesByDay {
-  return { 前天: [], 昨天: [], 今天: [] };
+  return Object.fromEntries(
+    DAY_LABELS.map((label) => [label, []] as const),
+  ) as unknown as MessagesByDay;
 }
 
 function blankWallpapers(): WallpapersByDay {
-  return { 前天: [], 昨天: [], 今天: [] };
+  return Object.fromEntries(
+    DAY_LABELS.map((label) => [label, []] as const),
+  ) as unknown as WallpapersByDay;
 }
 
 function dayLabelFor(createdAt: string): DayLabel | null {
@@ -115,9 +129,9 @@ function dayLabelFor(createdAt: string): DayLabel | null {
   const difference = Math.round(
     (today.getTime() - created.getTime()) / (24 * 60 * 60 * 1000),
   );
-  if (difference === 0) return "今天";
-  if (difference === 1) return "昨天";
-  if (difference === 2) return "前天";
+  if (difference >= 0 && difference <= TODAY_INDEX) {
+    return DAY_LABELS[TODAY_INDEX - difference];
+  }
   return null;
 }
 
@@ -199,15 +213,31 @@ export function getSelectedWallpaper(
 }
 
 export function isLatestWallpaper(state: WallpaperSelectionState): boolean {
-  const todayCount = state.wallpapersByDay.今天.length;
+  const todayCount = state.wallpapersByDay[DAY_LABELS[TODAY_INDEX]]?.length ?? 0;
   return (
-    state.currentDayIndex === 2 &&
+    state.currentDayIndex === TODAY_INDEX &&
     (todayCount === 0 || state.currentWallpaperIndex === todayCount - 1)
   );
 }
 
 export function isFirstWallpaper(state: WallpaperSelectionState): boolean {
-  return state.currentDayIndex === 0 && state.currentWallpaperIndex === 0;
+  // Find the first non-empty day in the 7-day window
+  let firstNonEmptyDayIndex: number | null = null;
+  for (let i = 0; i < DAY_LABELS.length; i++) {
+    const items = state.wallpapersByDay[DAY_LABELS[i]];
+    if (items && items.length > 0) {
+      firstNonEmptyDayIndex = i;
+      break;
+    }
+  }
+  if (firstNonEmptyDayIndex === null) {
+    // No revisions at all — no older pages exist
+    return true;
+  }
+  return (
+    state.currentDayIndex === firstNonEmptyDayIndex &&
+    state.currentWallpaperIndex === 0
+  );
 }
 
 /**
@@ -281,11 +311,11 @@ export const useSceneStore = create<State>((set, get) => ({
     set((s) => ({ uiMode: s.uiMode === "wallpaper" ? "white" : "wallpaper" }));
   },
 
-  currentDayIndex: 2,
+  currentDayIndex: TODAY_INDEX,
   currentWallpaperIndex: 0,
   wallpapersByDay: blankWallpapers(),
   setCurrentDayIndex(index: number) {
-    if (index >= 0 && index <= 2) {
+    if (index >= 0 && index < DAY_LABELS.length) {
       const label = DAY_LABELS[index];
       set({
         currentDayIndex: index,
@@ -314,11 +344,9 @@ export const useSceneStore = create<State>((set, get) => ({
     // A wallpaper revision is also the authoritative record of the voice event
     // that produced it. Sync that transcript so the partner device does not keep
     // generating suggestions from stale, device-local chat history.
-    const syncedMessages: MessagesByDay = {
-      前天: [...previous.messagesByDay.前天],
-      昨天: [...previous.messagesByDay.昨天],
-      今天: [...previous.messagesByDay.今天],
-    };
+    const syncedMessages: MessagesByDay = Object.fromEntries(
+      DAY_LABELS.map((label) => [label, [...(previous.messagesByDay[label] ?? [])]]),
+    ) as MessagesByDay;
     for (const item of filteredItems) {
       const transcript = item.transcript?.trim();
       const speakerRole = item.speakerRole;
@@ -372,7 +400,9 @@ export const useSceneStore = create<State>((set, get) => ({
 
     const selectedRevisionId = getSelectedWallpaper(previous)?.revisionId;
     const wasLatest = isLatestWallpaper(previous);
-    const realItems: WallpapersByDay = { 前天: [], 昨天: [], 今天: [] };
+    const realItems: WallpapersByDay = Object.fromEntries(
+      DAY_LABELS.map((label) => [label, []]),
+    ) as unknown as WallpapersByDay;
 
     for (const item of [...filteredItems].sort((a, b) => a.eventSeq - b.eventSeq)) {
       const label = dayLabelFor(item.createdAt);
@@ -393,8 +423,8 @@ export const useSceneStore = create<State>((set, get) => ({
     let nextDayIndex = previous.currentDayIndex;
     let nextWallpaperIndex = previous.currentWallpaperIndex;
     if (wasLatest) {
-      nextDayIndex = 2;
-      nextWallpaperIndex = grouped.今天.length - 1;
+      nextDayIndex = TODAY_INDEX;
+      nextWallpaperIndex = (grouped[DAY_LABELS[TODAY_INDEX]]?.length ?? 1) - 1;
     } else if (selectedRevisionId) {
       for (let dayIndex = 0; dayIndex < DAY_LABELS.length; dayIndex += 1) {
         const foundIndex = grouped[DAY_LABELS[dayIndex]].findIndex(
@@ -424,11 +454,9 @@ export const useSceneStore = create<State>((set, get) => ({
   setWallpaperInteractions(items) {
     if (!items.length) return;
     const previous = get();
-    const syncedMessages: MessagesByDay = {
-      前天: [...previous.messagesByDay.前天],
-      昨天: [...previous.messagesByDay.昨天],
-      今天: [...previous.messagesByDay.今天],
-    };
+    const syncedMessages: MessagesByDay = Object.fromEntries(
+      DAY_LABELS.map((label) => [label, [...(previous.messagesByDay[label] ?? [])]]),
+    ) as MessagesByDay;
 
     for (const item of items) {
       const transcript = item.transcript.trim();
@@ -489,23 +517,46 @@ export const useSceneStore = create<State>((set, get) => ({
     const state = get();
     let dayIndex = state.currentDayIndex;
     let wallpaperIndex = state.currentWallpaperIndex;
-    const currentItems = state.wallpapersByDay[DAY_LABELS[dayIndex]];
+    const currentItems = state.wallpapersByDay[DAY_LABELS[dayIndex]] ?? [];
 
     if (dir === -1) {
+      // Move to older wallpaper within current day
       if (wallpaperIndex > 0) {
         wallpaperIndex -= 1;
-      } else if (dayIndex > 0) {
-        dayIndex -= 1;
-        wallpaperIndex = Math.max(
-          0,
-          state.wallpapersByDay[DAY_LABELS[dayIndex]].length - 1,
-        );
+      } else {
+        // Move to previous day, skipping empty buckets
+        let found = false;
+        for (let d = dayIndex - 1; d >= 0; d--) {
+          const items = state.wallpapersByDay[DAY_LABELS[d]];
+          if (items && items.length > 0) {
+            dayIndex = d;
+            wallpaperIndex = items.length - 1;
+            found = true;
+            break;
+          }
+        }
+        // If no non-empty day found, stay at current position
+        if (!found) return;
       }
-    } else if (wallpaperIndex < currentItems.length - 1) {
-      wallpaperIndex += 1;
-    } else if (dayIndex < DAY_LABELS.length - 1) {
-      dayIndex += 1;
-      wallpaperIndex = 0;
+    } else {
+      // Move to newer wallpaper within current day
+      if (wallpaperIndex < currentItems.length - 1) {
+        wallpaperIndex += 1;
+      } else {
+        // Move to next day, skipping empty buckets
+        let found = false;
+        for (let d = dayIndex + 1; d < DAY_LABELS.length; d++) {
+          const items = state.wallpapersByDay[DAY_LABELS[d]];
+          if (items && items.length > 0) {
+            dayIndex = d;
+            wallpaperIndex = 0;
+            found = true;
+            break;
+          }
+        }
+        // If no non-empty day found, stay at current position
+        if (!found) return;
+      }
     }
 
     set({

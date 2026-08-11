@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useI18n } from "@/lib/i18n";
+import { TODAY_INDEX } from "@/lib/hooks/useSceneStore";
 
 type DateParts = {
   dateLine: string;
@@ -11,7 +12,7 @@ type DateParts = {
 function formatClock(locale: string, dayIndex: number): DateParts {
   const now = new Date();
   const displayedDate = new Date(now);
-  displayedDate.setDate(now.getDate() - (2 - dayIndex));
+  displayedDate.setDate(now.getDate() - (TODAY_INDEX - dayIndex));
   const dtf = new Intl.DateTimeFormat(locale, {
     weekday: "long",
     month: "long",

@@ -57,6 +57,7 @@ import {
   isLatestWallpaper,
   useSceneStore,
   getWallpaperInteractionMode,
+  TODAY_INDEX,
 } from "@/lib/hooks/useSceneStore";
 import { useOnboardingStore } from "@/lib/hooks/useOnboardingStore";
 import { useWallpaperVoiceEditRecorder } from "@/lib/hooks/useWallpaperVoiceEditRecorder";
@@ -571,7 +572,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   const canLiftChecks = {
     uiModeIsWallpaper: uiMode === "wallpaper",
     isLatest,
-    isToday: currentDayIndex === 2,
+    isToday: currentDayIndex === TODAY_INDEX,
     insertReady: initialInsertStatus === "ready",
     voiceIdle: voiceStatus === "idle",
     hasGeneratedWallpaperUrl: !!activeWallpaperUrl,

@@ -272,22 +272,25 @@ export function WallpaperStage() {
       uiMode === "wallpaper" &&
       availableWallpapers.length >= 2 ? (
         <div
-          className="pointer-events-none absolute bottom-8 left-0 right-0 z-40 flex justify-center gap-2"
+          className="pointer-events-none absolute left-0 right-0 z-40 flex justify-center"
+          style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 5rem)" }}
           aria-hidden
         >
-          {availableWallpapers.map((_, i) => {
-            const isActive = i === currentPageIndex;
-            return (
-              <div
-                key={i}
-                className={`rounded-full transition-all duration-200 ${
-                  isActive
-                    ? "h-2 w-5 bg-white/90 shadow-sm"
-                    : "h-2 w-2 bg-white/40"
-                }`}
-              />
-            );
-          })}
+          <div className="flex items-center gap-2 rounded-full bg-black/25 py-1.5 px-3 shadow-sm backdrop-blur-sm">
+            {availableWallpapers.map((_, i) => {
+              const isActive = i === currentPageIndex;
+              return (
+                <div
+                  key={i}
+                  className={`rounded-full transition-all duration-200 ${
+                    isActive
+                      ? "h-2 w-5 bg-white/90"
+                      : "h-2 w-2 bg-white/50"
+                  }`}
+                />
+              );
+            })}
+          </div>
         </div>
       ) : null}
 

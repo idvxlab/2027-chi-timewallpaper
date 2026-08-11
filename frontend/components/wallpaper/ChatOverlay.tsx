@@ -7,6 +7,7 @@ import {
   isFirstWallpaper,
   isLatestWallpaper,
   useSceneStore,
+  DAY_LABELS,
 } from "@/lib/hooks/useSceneStore";
 import type { Message } from "@/lib/hooks/useSceneStore";
 import { useOnboardingStore } from "@/lib/hooks/useOnboardingStore";
@@ -711,7 +712,7 @@ export function ChatOverlay() {
   const currentWallpaperIndex = useSceneStore((s) => s.currentWallpaperIndex);
   const currentDayWallpapers = useSceneStore(
     (s) =>
-      s.wallpapersByDay[(["前天", "昨天", "今天"] as const)[s.currentDayIndex]],
+      s.wallpapersByDay[DAY_LABELS[s.currentDayIndex]] ?? [],
   );
   const shiftWallpaper = useSceneStore((s) => s.shiftWallpaper);
   const isFirst = useSceneStore(isFirstWallpaper);
@@ -798,7 +799,7 @@ export function ChatOverlay() {
   }, [voiceStatus, t]);
 
   const isWhite = uiMode === "white";
-  const dayKey = (["前天", "昨天", "今天"] as const)[currentDayIndex];
+  const dayKey = DAY_LABELS[currentDayIndex] ?? "今天";
   const todayMessages = messagesByDay[dayKey] ?? [];
   const replyContextMessages = todayMessages;
   const replyTarget =

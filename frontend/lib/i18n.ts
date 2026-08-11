@@ -7,6 +7,7 @@
 
 import { useCallback, useMemo } from "react";
 import { useAppPreferencesStore, type AppLanguage } from "./hooks/useAppPreferencesStore";
+import { TODAY_INDEX } from "./hooks/useSceneStore";
 
 // ── Key types ────────────────────────────────────────────────────────────────
 
@@ -472,7 +473,7 @@ export function useI18n(): UseI18nReturn {
 export function formatLongDate(dayIndex: number, locale: string): string {
   const today = new Date();
   const target = new Date(today);
-  target.setDate(today.getDate() - (2 - dayIndex));
+  target.setDate(today.getDate() - (TODAY_INDEX - dayIndex));
 
   if (locale === "zh-CN") {
     const dayNames = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
@@ -493,7 +494,7 @@ export function formatLongDate(dayIndex: number, locale: string): string {
 export function formatSummaryDate(dayIndex: number, locale: string): string {
   const today = new Date();
   const target = new Date(today);
-  target.setDate(today.getDate() - (2 - dayIndex));
+  target.setDate(today.getDate() - (TODAY_INDEX - dayIndex));
 
   if (locale === "zh-CN") {
     const dayNames = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
