@@ -1020,7 +1020,7 @@ export function ChatOverlay() {
           className="absolute inset-0 bg-[rgba(250,246,238,0.34)]"
         />
 
-        {/* Download wallpaper button */}
+        {/* Download wallpaper button — moved to top-left */}
         <button
           type="button"
           aria-label={language === "zh" ? "下载壁纸" : "Download wallpaper"}
@@ -1030,7 +1030,7 @@ export function ChatOverlay() {
             event.stopPropagation();
             void handleDownloadWallpaper();
           }}
-          className="pointer-events-auto absolute right-[clamp(16px,3.5vw,28px)] top-[clamp(16px,2.5vh,28px)] z-[100] flex h-[56px] w-[56px] items-center justify-center rounded-full bg-white/[0.82] text-black shadow-[0_7px_16px_rgba(58,48,39,0.15)] backdrop-blur-md transition active:translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-40"
+          className="pointer-events-auto absolute left-[clamp(16px,3.5vw,28px)] top-[clamp(16px,2.5vh,28px)] z-[100] flex h-[56px] w-[56px] items-center justify-center rounded-full bg-white/[0.82] text-black shadow-[0_7px_16px_rgba(58,48,39,0.15)] backdrop-blur-md transition active:translate-y-0.5 disabled:cursor-not-allowed disabled:opacity-40"
         >
           <svg
             aria-hidden="true"
@@ -1048,14 +1048,15 @@ export function ChatOverlay() {
           </svg>
         </button>
 
+        {/* Close button — top-right */}
         <button
           type="button"
-          aria-label={t("chat.backToWallpaper")}
+          aria-label={t("chat.closeSummary")}
           onClick={(e) => {
             e.stopPropagation();
             toggleUiMode();
           }}
-          className="pointer-events-auto absolute left-[clamp(16px,3.5vw,28px)] top-[clamp(16px,2.5vh,28px)] z-[100] flex h-[56px] w-[56px] items-center justify-center rounded-full bg-white/[0.82] text-black shadow-[0_7px_16px_rgba(58,48,39,0.15)] backdrop-blur-md transition hover:-translate-x-0.5 active:translate-x-0"
+          className="pointer-events-auto absolute right-[clamp(16px,3.5vw,28px)] top-[clamp(16px,2.5vh,28px)] z-[100] flex h-[56px] w-[56px] items-center justify-center rounded-full bg-white/[0.82] text-black shadow-[0_7px_16px_rgba(58,48,39,0.15)] backdrop-blur-md transition hover:-translate-x-0.5 active:translate-x-0"
         >
           <svg
             viewBox="0 0 24 24"
@@ -1067,8 +1068,8 @@ export function ChatOverlay() {
             className="h-7 w-7"
             aria-hidden
           >
-            <path d="M19 12H5" />
-            <path d="M12 19l-7-7 7-7" />
+            <path d="M18 6 6 18" />
+            <path d="m6 6 12 12" />
           </svg>
         </button>
 

@@ -106,6 +106,7 @@ export type I18nKey =
   | "chat.generating"
   | "chat.openSuggestions"
   | "chat.backToWallpaper"
+  | "chat.closeSummary"
   | "chat.prevWallpaper"
   | "chat.nextWallpaper"
   | "chat.aiSuggestions"
@@ -244,6 +245,7 @@ const en: Record<I18nKey, string> = {
   "chat.generating": "Generating new wallpaper...",
   "chat.openSuggestions": "Open communication suggestions",
   "chat.backToWallpaper": "Back to wallpaper",
+  "chat.closeSummary": "Close summary",
   "chat.prevWallpaper": "View previous wallpaper",
   "chat.nextWallpaper": "View next wallpaper",
   "chat.aiSuggestions": "AI Suggestions",
@@ -381,6 +383,7 @@ const zh: Record<I18nKey, string> = {
   "chat.generating": "正在生成新壁纸…",
   "chat.openSuggestions": "打开沟通建议",
   "chat.backToWallpaper": "返回壁纸",
+  "chat.closeSummary": "关闭摘要",
   "chat.prevWallpaper": "查看上一张壁纸",
   "chat.nextWallpaper": "查看下一张壁纸",
   "chat.aiSuggestions": "AI 建议",

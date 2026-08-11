@@ -44,7 +44,7 @@ export function MemoryAssetsPanel({
         type="button"
         aria-label={t("memory.close")}
         onClick={onClose}
-        className="absolute left-[clamp(16px,3.5vw,28px)] top-[clamp(16px,2.5vh,28px)] z-[100] flex h-[56px] w-[56px] items-center justify-center rounded-full bg-white/[0.82] text-black shadow-[0_7px_16px_rgba(58,48,39,0.15)] backdrop-blur-md transition hover:-translate-x-0.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-black active:translate-x-0"
+        className="absolute right-[clamp(16px,3.5vw,28px)] top-[clamp(16px,2.5vh,28px)] z-[100] flex h-[56px] w-[56px] items-center justify-center rounded-full bg-white/[0.82] text-black shadow-[0_7px_16px_rgba(58,48,39,0.15)] backdrop-blur-md transition hover:-translate-x-0.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-black active:translate-x-0"
       >
         <svg
           viewBox="0 0 24 24"
@@ -56,8 +56,8 @@ export function MemoryAssetsPanel({
           className="h-7 w-7"
           aria-hidden="true"
         >
-          <path d="M19 12H5" />
-          <path d="M12 19l-7-7 7-7" />
+          <path d="M18 6 6 18" />
+          <path d="m6 6 12 12" />
         </svg>
       </button>
 
@@ -156,18 +156,7 @@ export function MemoryAssetsPanel({
             </div>
           )}
         </div>
-
-        <p className="mt-5 shrink-0 text-center text-[clamp(18px,3.1vw,23px)] font-bold text-black/[0.45]">
-          {t("memory.swipeDown")}
-        </p>
       </section>
-
-      <button
-        type="button"
-        onClick={onClose}
-        aria-label={t("memory.close")}
-        className="absolute inset-x-0 bottom-0 z-[90] h-[12%] cursor-s-resize bg-transparent focus:outline-none"
-      />
 
       <style jsx>{`
         .asset-panel-enter {

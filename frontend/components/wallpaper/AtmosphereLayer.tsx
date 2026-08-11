@@ -26,10 +26,13 @@ const FOCUS_TRANSFORM: Record<FocusMode, string> = {
 const IMG_W = 1800;
 const IMG_H = 3229;
 const WALLPAPER_CROSSFADE_MS = 2000;
+const PAGE_TRANSITION_MS = 220;
 
 type AtmosphereLayerProps = {
   motionPaused?: boolean;
   cameraPositionX?: number;
+  pageTransition?: "idle" | "exiting" | "entering";
+  transitionDirection?: "next" | "prev";
 };
 
 function FocusToggleIcon({ isFocused }: { isFocused: boolean }) {
@@ -125,6 +128,8 @@ function FocusButton({
 export function AtmosphereLayer({
   motionPaused = false,
   cameraPositionX = 0.5,
+  pageTransition = "idle",
+  transitionDirection = "next",
 }: AtmosphereLayerProps) {
   const { t } = useI18n();
   const selectedWallpaper = useSceneStore(getSelectedWallpaper);
@@ -258,10 +263,29 @@ export function AtmosphereLayer({
             data-motion-paused={motionPaused ? "true" : "false"}
             data-wallpaper-position-x={`${cameraPositionPercent}%`}
             className="wallpaper-motion-surface pre-wallpaper absolute inset-0"
-            style={{
-              transform: `translate3d(0, 0, 0) scale(${cameraScale})`,
-            }}
+            style={
+              pageTransition !== "idle"
+                ? {
+                    animation:
+                      pageTransition === "exiting"
+                ? `wallpaper-slide-out ${PAGE_TRANSITION_MS}ms ease-in-out forwards`
+                : `wallpaper-slide-in ${PAGE_TRANSITION_MS}ms ease-out forwards`,
+                  }
+                : {
+                    transform: `translate3d(0, 0, 0) scale(${cameraScale})`,
+                  }
+            }
           >
+            <style>{`
+              @keyframes wallpaper-slide-out {
+                0%   { opacity: 1; transform: translateX(0) scale(${cameraScale}); }
+                100% { opacity: 0.55; transform: translateX(${transitionDirection === "next" ? "-6%" : "6%"}) scale(${cameraScale}); }
+              }
+              @keyframes wallpaper-slide-in {
+                0%   { opacity: 0.55; transform: translateX(${transitionDirection === "next" ? "6%" : "-6%"}) scale(${cameraScale}); }
+                100% { opacity: 1; transform: translateX(0) scale(${cameraScale}); }
+              }
+            `}</style>
             {previousUrl ? (
               <div
                 aria-hidden="true"
