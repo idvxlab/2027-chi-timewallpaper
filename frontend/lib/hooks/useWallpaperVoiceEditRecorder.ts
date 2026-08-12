@@ -176,6 +176,24 @@ export function useWallpaperVoiceEditRecorder() {
     Set<(reason: "user_stop" | "silence" | "no_speech" | "error" | "max") => void>
   >(new Set());
 
+  // Listeners for generation success: called with the eventSeq when a voice
+  // interaction successfully generates a new wallpaper revision. Subject Lift
+  // uses this to set expectedJumpEventSeq for historical page auto-jump.
+  const generationSuccessListenersRef = useRef<Set<(eventSeq: number) => void>>(new Set());
+
+  const emitGenerationSuccess = useCallback((eventSeq: number) => {
+    const listeners = generationSuccessListenersRef.current;
+    if (!listeners.size) return;
+    const snapshot = Array.from(listeners);
+    for (const listener of snapshot) {
+      try {
+        listener(eventSeq);
+      } catch (err) {
+        console.error("[VOICE] generationSuccess listener threw", err);
+      }
+    }
+  }, []);
+
   const emitCaptureFinished = useCallback(
     (reason: "user_stop" | "silence" | "no_speech" | "error" | "max") => {
       const listeners = captureFinishedListenersRef.current;
@@ -238,6 +256,10 @@ export function useWallpaperVoiceEditRecorder() {
       }
       if (!wallpaperUrl) throw new Error(`Missing ${viewerRole} wallpaper view`);
       setGeneratedWallpaperUrl(wallpaperUrl);
+      // Emit generation success with eventSeq for Subject Lift auto-jump correlation.
+      if (eventSeq > 0) {
+        emitGenerationSuccess(eventSeq);
+      }
       return true;
     },
     [setGeneratedWallpaperUrl, setWallpaperInteractions],
@@ -677,23 +699,28 @@ export function useWallpaperVoiceEditRecorder() {
         return false;
       }
       const scene = useSceneStore.getState();
-      if (!isLatestWallpaper(scene) || !scene.generatedWallpaperUrl) {
-        console.warn(
-          "[VOICE] start_rejected: select the latest wallpaper before recording",
-        );
-        return false;
-      }
-      const interactionMode = getWallpaperInteractionMode(scene);
-      if (
-        (source === "central_button" &&
+      // Subject Lift: allow recording on ANY wallpaper revision.
+      // The cutout comes from the currently visible wallpaper;
+      // the backend uses latest shared wallpaper for generation.
+      if (source === "subject_lift") {
+        if (!scene.generatedWallpaperUrl) {
+          console.warn(
+            "[VOICE] start_rejected: no wallpaper available for subject lift",
+          );
+          return false;
+        }
+        // Central button: require initial_voice/processing mode
+      } else {
+        const interactionMode = getWallpaperInteractionMode(scene);
+        if (
           interactionMode !== "initial_voice" &&
-          interactionMode !== "processing") ||
-        (source === "subject_lift" && interactionMode !== "subject_lift")
-      ) {
-        console.warn(
-          `[VOICE] start_rejected: ${source} mode=${interactionMode}`,
-        );
-        return false;
+          interactionMode !== "processing"
+        ) {
+          console.warn(
+            `[VOICE] start_rejected: ${source} mode=${interactionMode}`,
+          );
+          return false;
+        }
       }
 
       try {
@@ -908,6 +935,16 @@ export function useWallpaperVoiceEditRecorder() {
     [],
   );
 
+  const subscribeGenerationSuccess = useCallback(
+    (listener: (eventSeq: number) => void): (() => void) => {
+      generationSuccessListenersRef.current.add(listener);
+      return () => {
+        generationSuccessListenersRef.current.delete(listener);
+      };
+    },
+    [],
+  );
+
   return {
     status,
     mode,
@@ -917,6 +954,7 @@ export function useWallpaperVoiceEditRecorder() {
     start,
     finishRecording,
     subscribeCaptureFinished,
+    subscribeGenerationSuccess,
   };
 }
 

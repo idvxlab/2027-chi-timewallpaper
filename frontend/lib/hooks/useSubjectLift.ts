@@ -1,28 +1,29 @@
 /**
- * useSubjectLift — long-press to "lift" a subject out of the wallpaper.
+ * useSubjectLift — hold-to-record Subject Lift.
  *
  * State machine:
  *
  *   idle
  *     │ pointerdown (on partner region)
  *     ▼
- *   pressing ──500ms──▶ extracting ──API ok──▶ waiting_for_release
+ *   pressing ──500ms──▶ extracting ──API ok──▶ armed_lifted
  *     │                      │                        │
  *     │                      └──API fail──────────────┘
  *     │ move>8px
  *     ▼
  *   idle
  *
- *   waiting_for_release
- *     │ pointerup (first release, extraction complete)
+ *   armed_lifted (cutout visible)
+ *     │ auto-record after ~2s hold → recording
+ *     │ or armed timeout (10s)
  *     ▼
- *   armed_lifted (10 second window)
- *     │ second tap on partner → recording (recording_pulsing)
- *     │ or timeout (10s)
+ *   releasing ──260ms──▶ idle
+ *
+ *   recording
+ *     │ pointerup (user releases) → stop recording, releasing
+ *     │ silence / max timeout → stop recording, releasing
  *     ▼
- *   releasing ──240ms──▶ idle
- *     │
- *     └── recording_pulsing → user click anywhere → finishRecording
+ *   releasing ──260ms──▶ idle
  *
  * Permission logic (shared wallpaper fixed layout):
  *   upper = child, lower = elder
@@ -31,6 +32,16 @@
  *
  * Only the partner region can be lifted. The viewer's own region
  * (self) cannot be lifted.
+ *
+ * Interaction flow (hold-to-record):
+ *   1. Long press partner region (~500ms)
+ *   2. Extraction begins (cache hit, in-flight join, or live request)
+ *   3. Cutout appears, lifts up
+ *   4. User continues holding (~2s)
+ *   5. Recording starts automatically
+ *   6. User speaks while holding
+ *   7. User releases → recording stops, cutout falls back
+ *   8. Backend: ASR → edit with latest wallpaper → generate
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -58,6 +69,9 @@ import {
   useSceneStore,
   getWallpaperInteractionMode,
   TODAY_INDEX,
+  DAY_LABELS,
+  type WallpapersByDay,
+  type WallpaperItem,
 } from "@/lib/hooks/useSceneStore";
 import { useOnboardingStore } from "@/lib/hooks/useOnboardingStore";
 import { useWallpaperVoiceEditRecorder } from "@/lib/hooks/useWallpaperVoiceEditRecorder";
@@ -362,19 +376,14 @@ async function getOrRequestPartnerCutout(params: {
   if (getPartnerRegion(currentViewerRole) !== params.region) {
     reasons.push("region_mismatch");
   }
-  if (!isLatestWallpaper({ currentDayIndex, currentWallpaperIndex, wallpapersByDay: currentWallpapersByDay })) {
-    reasons.push("not_latest");
-  }
+  // Historical wallpapers: removed isLatestWallpaper check to allow Subject Lift on any revision.
+  // The cutout comes from the currently visible wallpaper; voice generation always
+  // uses latest shared wallpaper on the backend (no frontend change needed).
   if (currentInsertStatus !== "ready") {
     reasons.push("insert_not_ready");
   }
-  if (currentInteractionMode !== "subject_lift") {
-    reasons.push("interaction_mode_mismatch");
-    console.log("[subject_prefetch] interaction_mode_check", {
-      currentInteractionMode,
-      expected: "subject_lift",
-    });
-  }
+  // Allow caching on historical wallpapers even when not in subject_lift mode.
+  // The stale guard for interaction mode is overly restrictive for historical pages.
 
   if (reasons.length > 0) {
     console.log("[subject_prefetch] action=stale_ignored", { key, staleReason: reasons });
@@ -401,8 +410,8 @@ async function getOrRequestPartnerCutout(params: {
 
 // ── useSubjectLift ─────────────────────────────────────────────────────────────
 
-// Long press threshold: 500ms
-const LONG_PRESS_MS = 500;
+// Long press threshold: 300ms (shortened for faster response)
+const LONG_PRESS_MS = 300;
 // Movement tolerance during long press
 const MOVE_TOLERANCE_PX = 8;
 // How long an armed subject stays lifted before auto-releasing (10 seconds)
@@ -412,6 +421,8 @@ const RELEASING_DURATION_MS = 260;
 // Minimum gap between start-recording event and any stop-recording trigger
 // to prevent the same pointer session from accidentally triggering stop.
 const REC_START_STOP_GUARD_MS = 300;
+// Auto-record delay: hold cutout visible for ~2 seconds before recording starts
+const AUTO_RECORD_DELAY_MS = 2000;
 
 /** Set to true to render translucent debug boxes for the upper/lower
  *  hit regions. See SubjectLiftLayer. */
@@ -432,7 +443,6 @@ export type LiftState =
   | { status: "idle" }
   | { status: "pressing"; clientX: number; clientY: number; region: SubjectRegion }
   | { status: "extracting"; clientX: number; clientY: number; region: SubjectRegion }
-  | { status: "waiting_for_release"; region: SubjectRegion }
   | {
       status: "armed_lifted";
       cutoutUrl: string;
@@ -507,7 +517,40 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     (s) => s.userContext?.relationshipId ?? "",
   );
 
-  const { status: voiceStatus } = useWallpaperVoiceEditRecorder();
+  const recorder = useWallpaperVoiceEditRecorder();
+  const { status: voiceStatus, subscribeGenerationSuccess } = recorder;
+
+  // Subscribe to generation success events for historical auto-jump.
+  useEffect(() => {
+    const unsubscribe = subscribeGenerationSuccess((eventSeq: number) => {
+      const pending = historicalVoicePendingRef.current;
+      if (pending && eventSeq > 0) {
+        console.log("[SubjectLift] generation success, setting expected eventSeq", {
+          eventSeq,
+          relId: pending.relationshipId,
+        });
+        useSceneStore.getState().setExpectedJumpEventSeq(eventSeq, pending.relationshipId);
+      }
+      // Consume the flag regardless of whether it was set
+      historicalVoicePendingRef.current = null;
+    });
+    return unsubscribe;
+  }, [subscribeGenerationSuccess]);
+
+  // Clear historicalVoicePendingRef on terminal idle state.
+  // This catches all failure paths that don't emit generation success:
+  // - too short recording
+  // - ASR failure
+  // - HTTP error
+  // - generation error
+  // - timeout/cancellation
+  // When voiceStatus returns to "idle" after being non-idle, clear any stale pending flag.
+  useEffect(() => {
+    if (voiceStatus === "idle" && historicalVoicePendingRef.current) {
+      console.log("[SubjectLift] voice returned to idle without success, clearing pending");
+      historicalVoicePendingRef.current = null;
+    }
+  }, [voiceStatus]);
 
   // ── Refs ──────────────────────────────────────────────────────────────
   const pressSessionIdRef = useRef(0);
@@ -519,11 +562,35 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     bbox: { x: number; y: number; width: number; height: number };
     region: SubjectRegion;
   } | null>(null);
-  const firstReleaseDoneRef = useRef(false);
+  // Frozen interaction source: captured at pointerdown to prevent reactive store changes
+  // from affecting an in-progress interaction.
+  const interactionSourceRef = useRef<{
+    sessionId: number;
+    wallpaperUrl: string;
+    revisionId: string;
+    relationshipId: string;
+    viewerRole: ViewerRole;
+    personRole: PersonRole;
+    region: SubjectRegion;
+    // True when the interaction started from a historical (non-latest) page.
+    // Used to trigger auto-jump to latest after generation completes.
+    isFromHistoricalPage: boolean;
+  } | null>(null);
+  const autoRecordTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const armedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Guards the start-recording click from being immediately interpreted as
   // a stop-recording trigger by the global recording-stop listener.
   const recordingStartedAtRef = useRef(0);
+  // Flag set when user releases pointer during "starting" state.
+  // When the async recorder start resolves, this is checked and triggers immediate stop.
+  const pointerReleasedDuringStartRef = useRef(false);
+  // Flag set when recorder truly starts, indicating a historical voice interaction is pending.
+  // Consumed by generation success listener to set expectedJumpEventSeq.
+  // Reset on pointer release during starting, recorder start failure, or generation success.
+  // Stores the frozen relationshipId from the interaction that started this generation.
+  const historicalVoicePendingRef = useRef<{
+    relationshipId: string;
+  } | null>(null);
   // External recorder stop request (from "click anywhere while recording").
   // The hook receives the imperative recorder handle from the layer so the
   // stop request is funneled through here.
@@ -562,17 +629,11 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   }
 
   // ── Gating conditions ───────────────────────────────────────────────
-  // Use the SAME isLatestWallpaper selector the rest of the app uses so
-  // that older revisions of today are never eligible, regardless of URL.
-  const isLatest = isLatestWallpaper({
-    currentDayIndex,
-    currentWallpaperIndex,
-    wallpapersByDay,
-  });
+  // Allow Subject Lift on ANY wallpaper revision (historical or latest).
+  // The cutout comes from the currently visible wallpaper; the voice
+  // generation always uses the latest shared wallpaper on the backend.
   const canLiftChecks = {
     uiModeIsWallpaper: uiMode === "wallpaper",
-    isLatest,
-    isToday: currentDayIndex === TODAY_INDEX,
     insertReady: initialInsertStatus === "ready",
     voiceIdle: voiceStatus === "idle",
     hasGeneratedWallpaperUrl: !!activeWallpaperUrl,
@@ -608,12 +669,16 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   // ── Silent prefetch ───────────────────────────────────────────────────
   // After the shared wallpaper is fully synced, warm the cutout cache for the
   // current viewer so the first long-press hits the cache instead of the network.
+  // Prefetches the currently visible wallpaper (not just latest) for faster response.
   useEffect(() => {
     // Gate: only prefetch when the subject-lift flow is available.
     if (!canLift) return;
 
     // Must have relationship context.
     if (!relationshipId) return;
+
+    // Must have a visible wallpaper.
+    if (!activeWallpaperUrl) return;
 
     // Determine the partner region for this viewer.
     const region = getPartnerRegion(viewerRole);
@@ -622,7 +687,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
 
     const key = buildSubjectCutoutCacheKey({
       relationshipId,
-      wallpaperUrl: generatedWallpaperUrl,
+      wallpaperUrl: activeWallpaperUrl,
       viewerRole,
       personRole,
       region,
@@ -636,7 +701,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     // Catches StaleSubjectCutoutError to prevent unhandled promise rejection.
     getOrRequestPartnerCutout({
       relationshipId,
-      wallpaperUrl: generatedWallpaperUrl,
+      wallpaperUrl: activeWallpaperUrl,
       viewerRole,
       personRole,
       region,
@@ -654,20 +719,70 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     });
   }, [
     // Re-trigger when the wallpaper identity changes (URL is the primary key).
-    generatedWallpaperUrl,
+    activeWallpaperUrl,
     relationshipId,
     viewerRole,
     // canLift aggregates everything else; re-run when it becomes true.
     canLift,
   ]);
 
+  // ── Auto-jump to latest after historical page generation ──────────────
+  // When a historical voice interaction succeeds, the backend sets expectedJumpEventSeq
+  // via setExpectedJumpEventSeq. When the revision appears in wallpapersByDay with
+  // matching eventSeq AND relationshipId, we jump to latest. Exact match prevents
+  // partner updates from triggering false jumps. RelationshipId binding prevents
+  // cross-relationship pollution.
+  const setCurrentDayIndex = useSceneStore((s) => s.setCurrentDayIndex);
+  const expectedJumpEventSeq = useSceneStore((s) => s.expectedJumpEventSeq);
+  const expectedJumpRelationshipId = useSceneStore((s) => s.expectedJumpRelationshipId);
+
+  useEffect(() => {
+    if (!expectedJumpEventSeq) return;
+    // Guard against relationship change: only proceed if current relationship matches
+    const currentRelationshipId = relationshipId;
+    if (expectedJumpRelationshipId && expectedJumpRelationshipId !== currentRelationshipId) {
+      console.log("[SubjectLift] relationship changed, clearing stale pending jump", {
+        expectedRelId: expectedJumpRelationshipId,
+        currentRelId: currentRelationshipId,
+      });
+      useSceneStore.getState().setExpectedJumpEventSeq(null, "");
+      return;
+    }
+
+    const currentUrl = generatedWallpaperUrl;
+    if (!currentUrl) return;
+
+    // Check if our expected revision has arrived in today's wallpapers
+    const todayWallpapers = wallpapersByDay[DAY_LABELS[TODAY_INDEX]] ?? [];
+    const matchingRevision = todayWallpapers.find(
+      (w: WallpaperItem) => w.eventSeq === expectedJumpEventSeq,
+    );
+
+    if (matchingRevision) {
+      console.log("[SubjectLift] expected revision arrived, auto-jumping to latest", {
+        expectedEventSeq: expectedJumpEventSeq,
+      });
+      setCurrentDayIndex(TODAY_INDEX);
+      // Clear expected eventSeq after jump
+      useSceneStore.getState().setExpectedJumpEventSeq(null, "");
+    }
+  }, [generatedWallpaperUrl, wallpapersByDay, expectedJumpEventSeq, expectedJumpRelationshipId, relationshipId, setCurrentDayIndex]);
+
   // ── Cleanup helpers ─────────────────────────────────────────────────
+  const clearAutoRecordTimer = useCallback(() => {
+    if (autoRecordTimerRef.current !== null) {
+      clearTimeout(autoRecordTimerRef.current);
+      autoRecordTimerRef.current = null;
+    }
+  }, []);
+
   const cancelPress = useCallback(() => {
     pressSessionIdRef.current = 0;
     recognizedSessionIdRef.current = null;
+    clearAutoRecordTimer();
     // Note: in-flight module-level requests are NOT aborted here.
     // They complete and are guarded by the stale check.
-  }, []);
+  }, [clearAutoRecordTimer]);
 
   const clearArmedTimeout = useCallback(() => {
     if (armedTimeoutRef.current !== null) {
@@ -682,20 +797,143 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     region: SubjectRegion,
   ) => {
     clearArmedTimeout();
+    clearAutoRecordTimer();
     transitionState({ status: "releasing", cutoutUrl, bbox, region });
-  }, [clearArmedTimeout]);
+  }, [clearArmedTimeout, clearAutoRecordTimer]);
 
-  // ── Try to enter armed_lifted ────────────────────────────────────────
-  // Only enters if BOTH extraction is complete AND first release has happened
-  const tryEnterArmedLifted = useCallback(() => {
+  // ── Start recording ──────────────────────────────────────────────────
+  // Clears the 10-second armed timeout, transitions through "starting" while
+  // awaiting the real recorder pipeline, and only enters "recording" once
+  // the pipeline is verified live. If the pipeline fails, the state falls
+  // back to "armed_lifted" so the subject visual stays lifted and the user
+  // can retry — never a phantom recorder.
+  const startRecording = useCallback(
+    async (viewerRole: ViewerRole): Promise<boolean> => {
+      if (liftStateRef.current.status !== "armed_lifted") {
+        console.log(
+          "[SubjectLift] startRecording blocked: not armed_lifted",
+          liftStateRef.current.status,
+        );
+        return false;
+      }
+
+      // Snapshot current visual state for the await.
+      const result = extractionResultRef.current;
+      if (!result) {
+        console.log("[SubjectLift] startRecording blocked: no extraction result");
+        return false;
+      }
+
+      // Clear the armed timeout — recording is now in control.
+      clearArmedTimeout();
+      recordingStartedAtRef.current = Date.now();
+
+      console.log("[SUBJECT_LIFT] starting", {
+        region: result.region,
+        viewerRole,
+      });
+      console.log("[subject_lift_transition]", {
+        from: "armed_lifted",
+        to: "starting",
+        reason: "auto_record_timer",
+        sessionId: pressSessionIdRef.current,
+      });
+      transitionState({ status: "starting", ...result });
+
+      // Await real recorder readiness. The bridge contract is Promise<boolean>.
+      const startHook = onStartRecordingRef.current;
+      if (!startHook) {
+        console.warn(
+          "[SubjectLift] startRecording aborted: no recorder bridge registered",
+        );
+        // Roll back to armed_lifted so the user can retry.
+        transitionState({ status: "armed_lifted", ...result });
+        return false;
+      }
+
+      let ok = false;
+      try {
+        ok = await startHook(viewerRole);
+      } catch (err) {
+        console.error("[SubjectLift] recorder bridge threw", err);
+        ok = false;
+      }
+
+      // If user released pointer during "starting", stop immediately.
+      // We check the flag (set by pointerup) to handle the race condition.
+      // DO NOT transition UI state - pointerup already entered releasing.
+      if (pointerReleasedDuringStartRef.current) {
+        console.log("[SubjectLift] pointer released during starting, stopping recorder");
+        pointerReleasedDuringStartRef.current = false;
+        // Clear historical voice pending since no valid recording will happen.
+        historicalVoicePendingRef.current = null;
+        const stopHook = onStopRecordingRef.current;
+        if (stopHook && ok) {
+          stopHook();
+        }
+        // Just do cleanup, don't transition UI (pointerup already handled it)
+        return false;
+      }
+
+      if (!ok) {
+        console.log(
+          "[SUBJECT_LIFT] recorder_start_failed returning to armed_lifted",
+          { viewerRole },
+        );
+        // Clear historical voice pending flag since no generation will happen.
+        historicalVoicePendingRef.current = null;
+        // Roll back to armed_lifted — do NOT animate the cutout away.
+        transitionState({ status: "armed_lifted", ...result });
+        return false;
+      }
+
+      hasEnteredRecordingRef.current = true;
+      setHasEnteredRecording(true);
+      // Pin a new recording-session sequence id so any stale
+      // capture-finished notification from a previous (now superseded)
+      // recording can be ignored.
+      currentRecordingSeqRef.current = ++startRecordingSeqRef.current;
+      // Set historical voice pending flag if this is from a historical page.
+      // This flag will be consumed when generation succeeds or fails.
+      // Store the frozen relationshipId from the interaction source.
+      if (interactionSourceRef.current?.isFromHistoricalPage === true) {
+        historicalVoicePendingRef.current = {
+          relationshipId: interactionSourceRef.current.relationshipId ?? "",
+        };
+      } else {
+        historicalVoicePendingRef.current = null;
+      }
+      console.log("[SUBJECT_LIFT] recording", {
+        region: result.region,
+        viewerRole,
+        seq: currentRecordingSeqRef.current,
+      });
+      console.log("[subject_lift_transition]", {
+        from: "starting",
+        to: "recording",
+        reason: "recorder_pipeline_ready",
+        sessionId: pressSessionIdRef.current,
+      });
+      transitionState({ status: "recording", ...result });
+      return true;
+    },
+    [clearArmedTimeout],
+  );
+
+  // ── Internal helper to start recording ─────────────────────────────────
+  // Calls startRecording with current viewerRole. Used by auto-record timer.
+  const doStartRecording = useCallback(async () => {
+    if (liftStateRef.current.status !== "armed_lifted") return;
+    await startRecording(viewerRole);
+  }, [viewerRole, startRecording]);
+
+  // ── Enter armed_lifted and start auto-record timer ────────────────────
+  // After extraction completes, immediately enter armed_lifted and start
+  // the auto-record timer. If user releases before timer fires, cancel.
+  const enterArmedLifted = useCallback(() => {
     const result = extractionResultRef.current;
-    const prevStatus = state.status;
     if (!result) {
-      console.log("[SubjectLift] tryEnterArmedLifted: no extraction result");
-      return;
-    }
-    if (!firstReleaseDoneRef.current) {
-      console.log("[SubjectLift] tryEnterArmedLifted: waiting for first release");
+      console.log("[SubjectLift] enterArmedLifted: no extraction result");
       return;
     }
 
@@ -705,15 +943,12 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       region: result.region,
     });
 
-    // Start the 10 second armed timer — this fires only after BOTH
-    // extraction success and the first pointerup. If extraction finished
-    // first (race A), this is reached via pointerup. If pointerup came
-    // first (race B), this is reached via runExtraction success.
+    clearAutoRecordTimer();
     clearArmedTimeout();
+
+    // Start the 10 second armed timeout
     armedTimeoutRef.current = setTimeout(() => {
-      console.log(
-        `[subject_lift_release] reason=armed_timeout status=${prevStatus}`,
-      );
+      console.log("[subject_lift_release] reason=armed_timeout");
       if (extractionResultRef.current) {
         enterReleasing(
           extractionResultRef.current.cutoutUrl,
@@ -723,24 +958,26 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       }
     }, ARMED_TIMEOUT_MS);
 
+    // Start auto-record timer: recording starts ~2 seconds after cutout is visible
+    autoRecordTimerRef.current = setTimeout(() => {
+      console.log("[SubjectLift] auto-record timer fired, starting recording");
+      // Check if still in armed_lifted state
+      if (liftStateRef.current.status !== "armed_lifted") {
+        console.log("[SubjectLift] auto-record ignored: no longer armed_lifted");
+        return;
+      }
+      void doStartRecording();
+    }, AUTO_RECORD_DELAY_MS);
+
     console.log("[subject_lift_armed]", {
       timeout_ms: ARMED_TIMEOUT_MS,
+      auto_record_delay_ms: AUTO_RECORD_DELAY_MS,
       region: result.region,
       personRole: getPersonRoleByRegion(result.region),
     });
 
-    console.log("[subject_lift_transition]", {
-      from: prevStatus,
-      to: "armed_lifted",
-      reason: "extraction_success_and_first_release",
-      sessionId: pressSessionIdRef.current,
-      region: result.region,
-      firstReleaseDone: firstReleaseDoneRef.current,
-      hasExtractionResult: true,
-    });
-
     transitionState({ status: "armed_lifted", ...result });
-  }, [clearArmedTimeout, enterReleasing, state.status]);
+  }, [clearArmedTimeout, clearAutoRecordTimer, enterReleasing, doStartRecording]);
 
   // ── Reset when lift feature becomes ineligible ────────────────────────
   // Only collapse an *idle-ish* lift state when canLift flips off. Crucially
@@ -763,18 +1000,17 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     }
     cancelPress();
     clearArmedTimeout();
+    clearAutoRecordTimer();
     extractionResultRef.current = null;
-    firstReleaseDoneRef.current = false;
     setHasEnteredRecording(false);
     transitionState({ status: "idle" });
-  }, [canLift, cancelPress, clearArmedTimeout]);
+  }, [canLift, cancelPress, clearArmedTimeout, clearAutoRecordTimer]);
 
   // ── Releasing timeout ────────────────────────────────────────────────
   useEffect(() => {
     if (state.status !== "releasing") return;
     const id = window.setTimeout(() => {
       extractionResultRef.current = null;
-      firstReleaseDoneRef.current = false;
       setHasEnteredRecording(false);
       transitionState({ status: "idle" });
     }, RELEASING_DURATION_MS);
@@ -824,28 +1060,33 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     recognizedSessionIdRef.current = sessionId;
     transitionState({ status: "extracting", clientX, clientY, region });
 
-    const relationshipId = useOnboardingStore.getState().userContext?.relationshipId ?? "";
+    // Use frozen interaction source
+    const source = interactionSourceRef.current;
+    if (!source || source.sessionId !== sessionId) {
+      console.log("[SubjectLift] interaction source not available or session mismatch");
+      transitionState({ status: "idle" });
+      return;
+    }
 
     console.log("[api.extractSubject] start", {
-      imageUrl: activeWallpaperUrl,
+      imageUrl: source.wallpaperUrl,
       pointX: pt.normalizedX,
       pointY: pt.normalizedY,
-      region,
-      viewerRole,
+      region: source.region,
+      viewerRole: source.viewerRole,
     });
 
     let result: SubjectExtractionResult | null = null;
-    let source: "cache" | "joined_prefetch" | "live_request" = "live_request";
 
     try {
       // Use the shared helper: cache hit → immediate; in-flight join → no dup;
-      // live → POST.  We still use the user's actual normalized click point.
+      // live → POST.  We use the frozen interaction source, not reactive values.
       result = await getOrRequestPartnerCutout({
-        relationshipId,
-        wallpaperUrl: activeWallpaperUrl,
-        viewerRole,
-        personRole: getPartnerRole(viewerRole),
-        region,
+        relationshipId: source.relationshipId,
+        wallpaperUrl: source.wallpaperUrl,
+        viewerRole: source.viewerRole,
+        personRole: source.personRole,
+        region: source.region,
         normalizedX: pt.normalizedX,
         normalizedY: pt.normalizedY,
       });
@@ -913,50 +1154,31 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     }
 
     // Determine source for logging
-    const key = buildSubjectCutoutCacheKey({
-      relationshipId,
-      wallpaperUrl: activeWallpaperUrl,
-      viewerRole,
-      personRole: getPartnerRole(viewerRole),
-      region,
-    });
-    const wasCached = subjectCutoutCache.has(key);
-    source = wasCached ? "cache" : "live_request";
+    const sourceKey = interactionSourceRef.current
+      ? buildSubjectCutoutCacheKey({
+          relationshipId: interactionSourceRef.current.relationshipId,
+          wallpaperUrl: interactionSourceRef.current.wallpaperUrl,
+          viewerRole: interactionSourceRef.current.viewerRole,
+          personRole: interactionSourceRef.current.personRole,
+          region: interactionSourceRef.current.region,
+        })
+      : null;
+    const wasCached = sourceKey ? subjectCutoutCache.has(sourceKey) : false;
 
     console.log("[subject_lift_extraction]", {
-      source,
+      source: wasCached ? "cache" : "live_request",
       sessionId,
-      region,
+      region: source?.region,
       cutoutUrl: result.cutoutUrl.substring(0, 50) + "...",
       bbox: result.bbox,
     });
 
     // Validate the press session is still active before accepting this result.
-    // Even though the wallpaper/version checks passed, the user may have:
-    //   - cancelled the long press
-    //   - moved too far
-    //   - triggered another interaction
-    //   - changed viewer role mid-session
-    // If any of these happened, discard the result silently.
-    // Determine which states are valid to receive this result.
-    // Race A: extraction completes first → still in "extracting"
-    // Race B: user releases first → already in "waiting_for_release"
-    // Both are valid. The result should NOT be discarded just because
-    // status === "waiting_for_release" — that is the normal release-first race.
-    // Only discard on genuinely invalid states:
-    //   idle / pressing / armed_lifted / recording / releasing / error
-    //   OR a NEWER session (different sessionId)
-    //   OR a region mismatch in waiting_for_release
-    // Use the synchronous ref instead of the stale closure `state.status`.
-    // Cache hits and in-flight joins resolve synchronously (Promise already settled),
-    // so the closure `state` is still at its pre-await value (e.g. "pressing").
+    // Only accept in "extracting" state for hold-to-record flow.
     const currentStatus = liftStateRef.current.status;
     const isStaleSession =
       recognizedSessionIdRef.current !== sessionId ||
-      (currentStatus !== "extracting" &&
-        currentStatus !== "waiting_for_release") ||
-      (currentStatus === "waiting_for_release" &&
-        (liftStateRef.current as Extract<LiftState, { status: "waiting_for_release" }>).region !== region);
+      currentStatus !== "extracting";
 
     if (isStaleSession) {
       console.log("[subject_lift_stale_response_ignored]", {
@@ -991,26 +1213,18 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       sessionId,
       region,
       cutoutUrl: result.cutoutUrl.substring(0, 50) + "...",
-      firstReleaseDone: firstReleaseDoneRef.current,
       bbox: result.bbox,
     });
 
-    // Transition to waiting_for_release
+    // Immediately enter armed_lifted state and start auto-record timer
     console.log("[subject_lift_transition]", {
       from: "extracting",
-      to: "waiting_for_release",
+      to: "armed_lifted",
       sessionId,
       region,
-      firstReleaseDone: firstReleaseDoneRef.current,
-      hasExtractionResult: true,
     });
-    transitionState({ status: "waiting_for_release", region });
-
-    // If first release already happened, immediately enter armed_lifted
-    if (firstReleaseDoneRef.current) {
-      tryEnterArmedLifted();
-    }
-  }, [activeWallpaperUrl, imageSize, viewerRole, tryEnterArmedLifted]);
+    enterArmedLifted();
+  }, [activeWallpaperUrl, imageSize, viewerRole, enterArmedLifted]);
 
   // ── Pointer down handler ─────────────────────────────────────────────
   const onPointerDown = useCallback(
@@ -1114,14 +1328,26 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       }
 
       // ── Start long press timer ────────────────────────────────────────
-      // Reset the prior session's release/cutout state BEFORE bumping
-      // pressSessionIdRef so the next press can't inherit a stale
-      // firstReleaseDone or extractionResult from the previous session.
+      // Reset the prior session's state BEFORE bumping pressSessionIdRef
+      // so the next press can't inherit a stale extractionResult from the previous session.
       cancelPress();
-      firstReleaseDoneRef.current = false;
       extractionResultRef.current = null;
       setHasEnteredRecording(false);
       const sessionId = ++pressSessionIdRef.current;
+
+      // Freeze the interaction source at pointerdown time
+      const relationshipId = useOnboardingStore.getState().userContext?.relationshipId ?? "";
+      const selectedWallpaper = getSelectedWallpaper(useSceneStore.getState());
+      interactionSourceRef.current = {
+        sessionId,
+        wallpaperUrl: activeWallpaperUrl,
+        revisionId: selectedWallpaper?.revisionId ?? "",
+        relationshipId,
+        viewerRole,
+        personRole: getPartnerRole(viewerRole),
+        region: candidateRegion,
+        isFromHistoricalPage: !latestWallpaperSelected,
+      };
 
       transitionState({
         status: "pressing",
@@ -1172,6 +1398,10 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   );
 
   // ── Pointer up handler ───────────────────────────────────────────────
+  // For hold-to-record flow:
+  // - If in pressing/extracting: cancel the interaction
+  // - If in armed_lifted: user released before recording started → cancel
+  // - If in recording: user released → stop recording
   const onPointerUp = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
       console.log(
@@ -1179,7 +1409,6 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
         JSON.stringify({
           status: state.status,
           hasExtractionResult: !!extractionResultRef.current,
-          firstReleaseDone: firstReleaseDoneRef.current,
         }),
       );
 
@@ -1190,54 +1419,63 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
         return;
       }
 
-      // If we were in extracting state, do NOT cancel the in-flight
-      // extraction. The long press has already been recognized and
-      // release here is expected user behavior (race B).
-      //
-      // Keep the fetch alive and mark firstReleaseDone so that when
-      // runExtraction's success path runs, it can promote straight to
-      // armed_lifted via the tryEnterArmedLifted() call at the end of
-      // runExtraction.
+      // If we are in extracting state, cancel the extraction and interaction
       if (state.status === "extracting") {
-        firstReleaseDoneRef.current = true;
-
-        console.log("[subject_lift_release_while_extracting]", {
-          sessionId: recognizedSessionIdRef.current,
-          extractionInFlight: extractionInFlightRef.current,
-          region: (state as Extract<LiftState, { status: "extracting" }>).region,
-        });
-
+        console.log("[SubjectLift] pointerup while extracting, cancelling");
+        cancelPress();
+        transitionState({ status: "idle" });
         return;
       }
 
-      // If we are in waiting_for_release state, mark first release done
-      if (state.status === "waiting_for_release") {
-        firstReleaseDoneRef.current = true;
-        tryEnterArmedLifted();
-        return;
-      }
+  // If we are in armed_lifted state, user released before recording started
+  // Cancel auto-record timer and enter releasing (no recording)
+  if (state.status === "armed_lifted") {
+    console.log("[SubjectLift] pointerup while armed_lifted, cancelling (no recording)");
+    clearAutoRecordTimer();
+    if (extractionResultRef.current) {
+      enterReleasing(
+        extractionResultRef.current.cutoutUrl,
+        extractionResultRef.current.bbox,
+        extractionResultRef.current.region,
+      );
+    } else {
+      transitionState({ status: "idle" });
+    }
+    return;
+  }
 
-      // If we are in armed_lifted state, this is a second tap - handled by layer
-      // Just log for debugging
-      if (state.status === "armed_lifted") {
-        console.log("[SubjectLift] pointerup while armed_lifted (second tap)");
-        return;
-      }
+  // If we are in starting state, the user released while recorder was initializing.
+  // Immediately enter releasing for visual feedback. The async recorder start will
+  // still resolve, but we check pointerReleasedDuringStartRef to avoid entering recording.
+  if (state.status === "starting") {
+    console.log("[SubjectLift] pointerup while starting, immediately releasing");
+    pointerReleasedDuringStartRef.current = true;
+    // Immediate visual feedback: show releasing animation
+    // In starting state, extractionResultRef.current is always populated
+    if (extractionResultRef.current) {
+      enterReleasing(
+        extractionResultRef.current.cutoutUrl,
+        extractionResultRef.current.bbox,
+        extractionResultRef.current.region,
+      );
+    } else {
+      // Fallback: shouldn't happen in starting state, but safe fallback
+      transitionState({ status: "idle" });
+    }
+    return;
+  }
 
-      // If we are in releasing state, ignore
-      if (state.status === "releasing") {
-        return;
-      }
+  // If we are in releasing state, ignore
+  if (state.status === "releasing") {
+    return;
+  }
     },
-    [state, cancelPress, tryEnterArmedLifted],
+    [state, cancelPress, clearAutoRecordTimer, enterReleasing],
   );
 
   // ── Pointer cancel handler ────────────────────────────────────────────
   // Note: pointercancel is treated as a true cancellation — it aborts
-  // any in-flight extraction and resets the session. pointerup is the
-  // "user released the press" event and must NOT cancel the in-flight
-  // extraction (race B handling lives in onPointerUp's "extracting"
-  // branch).
+  // any in-flight extraction and resets the session.
   const onPointerCancel = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
       console.log("[SubjectLift] pointercancel", { status: state.status });
@@ -1254,6 +1492,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       });
 
       if (state.status === "armed_lifted" && extractionResultRef.current) {
+        clearAutoRecordTimer();
         enterReleasing(
           extractionResultRef.current.cutoutUrl,
           extractionResultRef.current.bbox,
@@ -1261,12 +1500,11 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
         );
       } else {
         extractionResultRef.current = null;
-        firstReleaseDoneRef.current = false;
         setHasEnteredRecording(false);
         transitionState({ status: "idle" });
       }
     },
-    [state, cancelPress, enterReleasing],
+    [state, cancelPress, clearAutoRecordTimer, enterReleasing],
   );
 
   const onContextMenu = useCallback((e: React.MouseEvent<HTMLElement>) => {
@@ -1282,99 +1520,6 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       clearArmedTimeout();
     };
   }, [cancelPress, clearArmedTimeout]);
-
-  // ── Start recording (called by layer on second tap) ─────────────────
-  // Clears the 10-second armed timeout, transitions through "starting" while
-  // awaiting the real recorder pipeline, and only enters "recording" once
-  // the pipeline is verified live. If the pipeline fails, the state falls
-  // back to "armed_lifted" so the subject visual stays lifted and the user
-  // can retry — never a phantom recorder.
-  const startRecording = useCallback(
-    async (viewerRole: ViewerRole): Promise<boolean> => {
-      if (state.status !== "armed_lifted") {
-        console.log(
-          "[SubjectLift] startRecording blocked: not armed_lifted",
-          state.status,
-        );
-        return false;
-      }
-
-      // Snapshot current visual state for the await.
-      const result = extractionResultRef.current;
-      if (!result) {
-        console.log("[SubjectLift] startRecording blocked: no extraction result");
-        return false;
-      }
-
-      // Clear the armed timeout — recording is now in control.
-      clearArmedTimeout();
-      recordingStartedAtRef.current = Date.now();
-
-      console.log("[SUBJECT_LIFT] starting", {
-        region: result.region,
-        viewerRole,
-      });
-      console.log("[subject_lift_transition]", {
-        from: "armed_lifted",
-        to: "starting",
-        reason: "user_second_tap",
-        sessionId: pressSessionIdRef.current,
-      });
-      transitionState({ status: "starting", ...result });
-
-      // Await real recorder readiness. The bridge contract is Promise<boolean>.
-      const startHook = onStartRecordingRef.current;
-      if (!startHook) {
-        console.warn(
-          "[SubjectLift] startRecording aborted: no recorder bridge registered",
-        );
-        // Roll back to armed_lifted so the user can tap again.
-        transitionState({ status: "armed_lifted", ...result });
-        return false;
-      }
-
-      let ok = false;
-      try {
-        ok = await startHook(viewerRole);
-      } catch (err) {
-        console.error("[SubjectLift] recorder bridge threw", err);
-        ok = false;
-      }
-
-      if (!ok) {
-        console.log(
-          "[SUBJECT_LIFT] recorder_start_failed returning to armed_lifted",
-          {
-            viewerRole,
-          },
-        );
-        // Roll back to armed_lifted — do NOT animate the cutout away.
-        transitionState({ status: "armed_lifted", ...result });
-        return false;
-      }
-
-      hasEnteredRecordingRef.current = true;
-      setHasEnteredRecording(true);
-      // Pin a new recording-session sequence id so any stale
-      // capture-finished notification from a previous (now superseded)
-      // recording can be ignored.
-      currentRecordingSeqRef.current = ++startRecordingSeqRef.current;
-      console.log("[SUBJECT_LIFT] recording", {
-        region: result.region,
-        viewerRole,
-        seq: currentRecordingSeqRef.current,
-      });
-      console.log("[subject_lift_transition]", {
-        from: "starting",
-        to: "recording",
-        reason: "recorder_pipeline_ready",
-        sessionId: pressSessionIdRef.current,
-      });
-      transitionState({ status: "recording", ...result });
-      return true;
-    },
-    [state.status, clearArmedTimeout],
-  );
 
   // ── Stop recording (called by layer on click-anywhere-while-recording) ──
   // Triggers the recorder stop (which will eventually flip status to

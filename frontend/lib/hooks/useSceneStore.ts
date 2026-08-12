@@ -190,6 +190,13 @@ type State = {
   generationSessionId: string;
   incrementGenerationSession: () => string;
 
+  // Expected eventSeq for historical page auto-jump: set when a historical
+  // voice interaction succeeds, cleared when the revision arrives or on failure.
+  // Bound to relationshipId to prevent cross-relationship pollution.
+  expectedJumpEventSeq: number;
+  expectedJumpRelationshipId: string;
+  setExpectedJumpEventSeq: (seq: number | null, relationshipId: string) => void;
+
   wallpaperEnvelope: WallpaperEnvelope;
   setWallpaperEnvelope: (env: WallpaperEnvelope) => void;
 
@@ -594,6 +601,15 @@ export const useSceneStore = create<State>((set, get) => ({
     const next = crypto.randomUUID();
     set({ generationSessionId: next });
     return next;
+  },
+
+  expectedJumpEventSeq: 0,
+  expectedJumpRelationshipId: "",
+  setExpectedJumpEventSeq(seq: number | null, relationshipId: string = "") {
+    set({
+      expectedJumpEventSeq: seq ?? 0,
+      expectedJumpRelationshipId: relationshipId,
+    });
   },
 
   wallpaperEnvelope: { emotion: "calm", intensity: 0.5 },

@@ -17,6 +17,7 @@ export type PointerUpDecision =
   | { kind: "cancel_idle" } // was "pressing"; short press before timer
   | { kind: "release_during_extracting"; region: SubjectRegion } // race B: keep fetch alive
   | { kind: "mark_release_done" } // was "waiting_for_release"; enter armed_lifted
+  | { kind: "cancel_no_recording" } // armed_lifted released before recording started
   | { kind: "noop_armed" } // already armed_lifted (second tap is handled by layer)
   | { kind: "noop_releasing" }
   | { kind: "noop_idle" };
@@ -37,18 +38,12 @@ export function decidePointerUp(state: LiftState): PointerUpDecision {
     case "pressing":
       return { kind: "cancel_idle" };
     case "extracting":
-      return { kind: "release_during_extracting", region: state.region };
-    case "waiting_for_release":
-      return { kind: "mark_release_done" };
+      return { kind: "cancel_idle" };
     case "armed_lifted":
-      return { kind: "noop_armed" };
+      return { kind: "cancel_no_recording" };
     case "starting":
-      // pointerup during the recorder-startup window is a no-op for the
-      // lift state machine — the recorder bridge owns the audio lifecycle.
       return { kind: "noop_armed" };
     case "recording":
-      // The hook doesn't explicitly handle recording in pointerup;
-      // falls through to the implicit "noop" branch.
       return { kind: "noop_armed" };
     case "releasing":
       return { kind: "noop_releasing" };

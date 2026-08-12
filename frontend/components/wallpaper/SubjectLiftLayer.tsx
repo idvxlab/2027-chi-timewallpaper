@@ -8,34 +8,27 @@
  *   idle
  *     │ pointerdown (on partner region, ~500ms)
  *     ▼
- *   pressing ──extraction success──▶ waiting_for_release
- *     │                                     │
- *     │ extraction fail                    │ pointerup (first release)
- *     ▼                                     ▼
- *   idle                              armed_lifted (10 second window)
- *                                          │
- *                                          │ second tap on partner → recording
- *                                          │ or 10s timeout
- *                                          ▼
- *                                        releasing ──240ms──▶ idle
+ *   pressing ──extraction success──▶ armed_lifted
+ *     │                                  │
+ *     │ extraction fail                 │ hold ~2s → recording
+ *     │ move >8px                       │ or armed timeout (10s)
+ *     ▼                                 ▼
+ *   idle                             releasing ──260ms──▶ idle
  *
  *   recording
- *     │ click anywhere (subject / background / other person) → user_stop
- *     │ recorder.onerror / MAX_TIMEOUT                       → recorder_*_stop
+ *     │ pointerup (user releases) → stop recording, releasing
+ *     │ silence / max timeout → stop recording, releasing
  *     ▼
- *   releasing ──240ms──▶ idle
+ *   releasing ──260ms──▶ idle
  *
  * Key behaviors:
  *   1. Only partner region can be lifted (based on viewerRole).
- *   2. First pointerup after extraction success enters armed_lifted.
- *   3. The 10-second armed timer starts ONLY when BOTH extraction has
- *      succeeded AND the first pointerup has occurred.
- *   4. Recording starts on second tap (subject), not on first release.
- *   5. While recording, the lifted subject gently pulses up-and-down
- *      (~10s cycle, no opacity flicker, no scale flicker).
- *   6. Click anywhere on the wallpaper while recording stops the
- *      recorder and immediately drops the subject back to its anchor
- *      position. The audio blob is forwarded to the existing
+ *   2. After extraction succeeds, cutout immediately enters armed_lifted.
+ *   3. Hold for ~2 seconds → recording starts automatically.
+ *   4. Release while recording → stop recording, cutout falls back.
+ *   5. Release before recording starts → cancel, no recording.
+ *   6. While recording, the lifted subject gently pulses up-and-down.
+ *   7. The audio blob is forwarded to the existing
  *      ASR / agent / image-generation pipeline via processRecording.
  */
 
@@ -204,7 +197,6 @@ export function SubjectLiftLayer({
       state.status === "armed_lifted" ||
       state.status === "recording" ||
       state.status === "releasing" ||
-      state.status === "waiting_for_release" ||
       state.status === "pressing" ||
       state.status === "extracting"
     ) {
@@ -296,7 +288,6 @@ export function SubjectLiftLayer({
     state.status === "armed_lifted" ||
     state.status === "starting" ||
     state.status === "recording" ||
-    state.status === "waiting_for_release" ||
     state.status === "releasing";
   const backgroundDim = isLifted ? 0.97 : 1;
 
@@ -480,20 +471,11 @@ export function SubjectLiftLayer({
       ) : null}
 
       {/* Extracting shimmer - show at press position */}
-      {(state.status === "extracting" || state.status === "waiting_for_release") &&
-      rect ? (
+      {state.status === "extracting" && rect ? (
         <LoadingSparkle
           containerRect={rect}
-          clientX={
-            state.status === "extracting"
-              ? (state as Extract<LiftState, { status: "extracting" }>).clientX
-              : null
-          }
-          clientY={
-            state.status === "extracting"
-              ? (state as Extract<LiftState, { status: "extracting" }>).clientY
-              : null
-          }
+          clientX={(state as Extract<LiftState, { status: "extracting" }>).clientX}
+          clientY={(state as Extract<LiftState, { status: "extracting" }>).clientY}
         />
       ) : null}
 
@@ -854,7 +836,6 @@ function DebugRegions({
   canLift: boolean;
   canLiftChecks: {
     uiModeIsWallpaper: boolean;
-    isToday: boolean;
     insertReady: boolean;
     voiceIdle: boolean;
     hasGeneratedWallpaperUrl: boolean;
@@ -921,7 +902,6 @@ function DebugRegions({
         {`viewerRole=${viewerRole}
 canLift=${canLift}
 uiMode? ${canLiftChecks.uiModeIsWallpaper}
-isToday? ${canLiftChecks.isToday}
 insertReady? ${canLiftChecks.insertReady}
 voiceIdle? ${canLiftChecks.voiceIdle}
 hasUrl? ${canLiftChecks.hasGeneratedWallpaperUrl}
