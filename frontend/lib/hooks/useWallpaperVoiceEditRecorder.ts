@@ -467,6 +467,11 @@ export function useWallpaperVoiceEditRecorder() {
       const durationMs = Date.now() - startedAtRef.current;
       const wav = encodePcmWav(allPcmRef.current, STREAM_SAMPLE_RATE);
       console.warn(`[WallpaperVoiceEdit] streaming unavailable; using flash: ${reason}`);
+      // Clear captureBusyRef: we are abandoning the stream pipeline and transitioning
+      // to flash recording. Flash will set up its own MediaRecorder.
+      captureBusyRef.current = false;
+      processingJobsRef.current.delete(processingJobIdRef.current);
+      syncLifecycleState();
       clearTimers();
       cleanupStreamingAudio();
       closeStreamSocket();
@@ -545,7 +550,11 @@ export function useWallpaperVoiceEditRecorder() {
       const recorder = mediaRecorderRef.current;
       if (!recorder || recorder.state === "inactive") {
         // Already inactive: still notify so any visual state can collapse.
+        // Complete cleanup so the next startRecording call is not blocked by stale state.
         emitCaptureFinished(reason);
+        captureBusyRef.current = false;
+        processingJobsRef.current.delete(processingJobIdRef.current);
+        syncLifecycleState();
         return;
       }
       console.log("[VOICE] stop_requested reason=flash_finish", { reason });
@@ -556,6 +565,9 @@ export function useWallpaperVoiceEditRecorder() {
       // ASR / image-generation pipeline completes.
       emitCaptureFinished(reason);
       clearTimers();
+      // Clear mediaRecorderRef immediately so a subsequent startRecording call
+      // does not see a stale recorder and reject with "media_recorder_exists".
+      mediaRecorderRef.current = null;
       const durationMs = Date.now() - startedAtRef.current;
       setElapsedSec(0);
       recorder.onstop = () => {
@@ -564,7 +576,6 @@ export function useWallpaperVoiceEditRecorder() {
           type: recorder.mimeType || "audio/webm",
         });
         flashChunksRef.current = [];
-        mediaRecorderRef.current = null;
         void processFlashRecording(blob, durationMs);
       };
       try {
@@ -835,6 +846,36 @@ export function useWallpaperVoiceEditRecorder() {
   const startRecording = useCallback(
     async (ctx: VoiceProcessingContext): Promise<boolean> => {
       console.log("[VOICE] start_requested", { ctx });
+
+      // ── Idempotent cleanup ─────────────────────────────────────────────
+      // Only clean up stale state if capture is NOT currently active.
+      // We must NOT stop a MediaRecorder or WebSocket that is legitimately
+      // recording for THIS session. The captureBusyRef is set to true AFTER
+      // all init refs are reset (line 987), so checking it here tells us
+      // whether a real capture is in progress.
+      if (!captureBusyRef.current) {
+        // No active capture — safe to clean up any stale recorder/socket from
+        // an abnormal previous stop (silence/timeout/error) that didn't finish cleanup.
+        const staleRecorder = mediaRecorderRef.current;
+        if (staleRecorder) {
+          console.warn("[VOICE] startRecording: cleaning stale MediaRecorder");
+          staleRecorder.onstop = null;
+          try { staleRecorder.stop(); } catch { /* already stopped */ }
+          staleRecorder.stream.getTracks().forEach((t) => t.stop());
+          mediaRecorderRef.current = null;
+        }
+        const staleSocket = streamSocketRef.current;
+        if (staleSocket) {
+          console.warn("[VOICE] startRecording: closing stale WebSocket");
+          staleSocket.onopen = null;
+          staleSocket.onmessage = null;
+          staleSocket.onerror = null;
+          staleSocket.onclose = null;
+          staleSocket.close();
+          streamSocketRef.current = null;
+        }
+      }
+
       // Freeze the immutable context immediately. All async pipeline stages read
       // from activeContextRef — never from mutable global state.
       activeContextRef.current = ctx;

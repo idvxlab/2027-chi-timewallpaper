@@ -6,7 +6,7 @@
  *   idle
  *     │ pointerdown (on partner region)
  *     ▼
- *   pressing ──500ms──▶ extracting ──API ok──▶ armed_lifted
+ *   pressing ──300ms──▶ extracting ──API ok──▶ armed_lifted
  *     │                      │                        │
  *     │                      └──API fail──────────────┘
  *     │ move>8px
@@ -15,13 +15,13 @@
  *
  *   armed_lifted (cutout visible)
  *     │ auto-record after ~2s hold → recording
- *     │ or armed timeout (10s)
+ *     │ (safety timeout fires only if pointer was released without proper cleanup)
  *     ▼
  *   releasing ──260ms──▶ idle
  *
  *   recording
  *     │ pointerup (user releases) → stop recording, releasing
- *     │ silence / max timeout → stop recording, releasing
+ *     │ (silence/no_speech/max/error are IGNORED while pointer is held)
  *     ▼
  *   releasing ──260ms──▶ idle
  *
@@ -34,7 +34,7 @@
  * (self) cannot be lifted.
  *
  * Interaction flow (hold-to-record):
- *   1. Long press partner region (~500ms)
+ *   1. Long press partner region (~300ms)
  *   2. Extraction begins (cache hit, in-flight join, or live request)
  *   3. Cutout appears, lifts up
  *   4. User continues holding (~2s)
@@ -632,6 +632,11 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   // This ref is mirrored into a tick-based state at the bottom of the hook
   // so React effects in the layer can subscribe to its changes.
   const hasEnteredRecordingRef = useRef(false);
+  // Tracks whether the user is actively holding the pointer down.
+  // Set to true on pointerdown, false on pointerup/pointercancel.
+  // Used to block abnormal release triggers (armed timeout, silence, etc.)
+  // when the user is still holding.
+  const pointerHeldRef = useRef(false);
 
   // ── Synchronous state mirror ─────────────────────────────────────────
   // Keeps a ref in sync with the React state so async callbacks (cache hits,
@@ -821,6 +826,8 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     pressSessionIdRef.current = 0;
     recognizedSessionIdRef.current = null;
     clearAutoRecordTimer();
+    // Also clear pointer held state since the press session is cancelled.
+    pointerHeldRef.current = false;
     // Note: in-flight module-level requests are NOT aborted here.
     // They complete and are guarded by the stale check.
   }, [clearAutoRecordTimer]);
@@ -946,10 +953,26 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
         );
         // Clear historical voice pending flag since no generation will happen.
         historicalVoicePendingRef.current = null;
-        // DO NOT stay in armed_lifted — that creates a permanent stuck state
-        // across revisions because the auto-record timer has already fired
-        // and no fresh timer exists. Transition through releasing so the
-        // next pointerdown starts from a clean slate.
+
+        // In hold-to-record mode, if the user is still holding the pointer,
+        // don't force a release. Transition back to armed_lifted so the user
+        // can retry (or keep holding for the recorder to become available).
+        // Only release if the pointer has already been released.
+        if (pointerHeldRef.current) {
+          console.log(
+            "[SubjectLift] recorder start failed but pointer still held — staying in armed_lifted",
+            { reason: okReason },
+          );
+          // Transition back to armed_lifted so user can retry when resources clear
+          if (extractionResultRef.current) {
+            transitionState({ status: "armed_lifted", ...extractionResultRef.current });
+          } else {
+            transitionState({ status: "idle" });
+          }
+          return false;
+        }
+
+        // Pointer was already released (abnormal path) — release the lift.
         if (extractionResultRef.current) {
           enterReleasing(
             extractionResultRef.current.cutoutUrl,
@@ -1034,9 +1057,20 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     clearAutoRecordTimer();
     clearArmedTimeout();
 
-    // Start the 10 second armed timeout
+    // Start a "safety" timeout — this only fires if the user somehow got
+    // stuck in armed_lifted WITHOUT pointerHeld (e.g. pointercancel fired without
+    // calling onPointerCancel). In normal hold-to-record flow, the pointer is
+    // always held until pointerup, so this should never fire.
     armedTimeoutRef.current = setTimeout(() => {
-      console.log("[subject_lift_release] reason=armed_timeout");
+      if (pointerHeldRef.current) {
+        // Pointer is still held — this is a bug in pointer tracking.
+        // Don't release; log a warning instead.
+        console.warn(
+          "[SubjectLift] ARMED_TIMEOUT fired but pointer is still held — ignoring",
+        );
+        return;
+      }
+      console.log("[subject_lift_release] reason=armed_timeout (pointer released)");
       if (extractionResultRef.current) {
         enterReleasing(
           extractionResultRef.current.cutoutUrl,
@@ -1058,7 +1092,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     }, AUTO_RECORD_DELAY_MS);
 
     console.log("[subject_lift_armed]", {
-      timeout_ms: ARMED_TIMEOUT_MS,
+      armed_timeout_ms: ARMED_TIMEOUT_MS,  // safety timeout: only fires if pointerReleased without proper cleanup
       auto_record_delay_ms: AUTO_RECORD_DELAY_MS,
       region: result.region,
       personRole: getPersonRoleByRegion(result.region),
@@ -1415,6 +1449,11 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
         return;
       }
 
+      // Mark pointer as held — this is cleared on pointerup/pointercancel.
+      // All abnormal release triggers (armed timeout, silence, etc.) MUST check
+      // this flag and only proceed when pointerHeldRef.current === false.
+      pointerHeldRef.current = true;
+
       // ── Start long press timer ────────────────────────────────────────
       // Reset the prior session's state BEFORE bumping pressSessionIdRef
       // so the next press can't inherit a stale extractionResult from the previous session.
@@ -1495,6 +1534,9 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   // - If in recording: user released → stop recording
   const onPointerUp = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
+      // User has released the pointer — clear held flag.
+      pointerHeldRef.current = false;
+
       console.log(
         "[SubjectLift] pointerup",
         JSON.stringify({
@@ -1569,6 +1611,8 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   // any in-flight extraction and resets the session.
   const onPointerCancel = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
+      // Pointer was cancelled (e.g. touch interrupted) — clear held flag.
+      pointerHeldRef.current = false;
       console.log("[SubjectLift] pointercancel", { status: state.status });
 
       const wasExtracting = state.status === "extracting";
@@ -1694,7 +1738,10 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   // continues for 30-60 seconds.
   //
   // Behaviour:
-  //   - state.status === "recording": transition to "releasing"
+  //   - state.status === "recording" + user_stop: transition to "releasing"
+  //   - state.status === "recording" + abnormal stop + pointer held: IGNORED
+  //     (silence/no_speech/max/error don't end a recording the user wants to keep)
+  //   - state.status === "recording" + abnormal stop + pointer released: transition to "releasing"
   //   - state.status === "starting":  roll back to "armed_lifted"
   //     (capture pipeline ended before it ever became recording — keep the
   //     visual available for the user to tap again)
@@ -1721,6 +1768,22 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       );
 
       if (liftStateRef.current.status === "recording") {
+        // For non-user_stop reasons (silence, no_speech, max, error), only allow
+        // releasing if the user has already released the pointer. In hold-to-record
+        // mode, abnormal stop triggers are IGNORED while the user is still holding.
+        // This prevents silence/no_speech/max timers from ending a recording
+        // that the user wants to continue.
+        if (
+          reason !== "user_stop" &&
+          pointerHeldRef.current
+        ) {
+          console.log(
+            "[SUBJECT_LIFT] capture_finished ignored: abnormal stop while pointer held",
+            { reason, pointerHeld: pointerHeldRef.current },
+          );
+          return;
+        }
+
         if (!result) {
           console.log(
             "[SubjectLift] capture_finished but no extraction result; collapsing to idle",

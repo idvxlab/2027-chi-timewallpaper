@@ -6,18 +6,18 @@
  * State machine integration:
  *
  *   idle
- *     │ pointerdown (on partner region, ~500ms)
+ *     │ pointerdown (on partner region, ~300ms)
  *     ▼
  *   pressing ──extraction success──▶ armed_lifted
  *     │                                  │
  *     │ extraction fail                 │ hold ~2s → recording
- *     │ move >8px                       │ or armed timeout (10s)
+ *     │ move >8px                       │ (safety timeout fires only if pointer was released without proper cleanup)
  *     ▼                                 ▼
  *   idle                             releasing ──260ms──▶ idle
  *
  *   recording
  *     │ pointerup (user releases) → stop recording, releasing
- *     │ silence / max timeout → stop recording, releasing
+ *     │ (silence/no_speech/max/error are IGNORED while pointer is held)
  *     ▼
  *   releasing ──260ms──▶ idle
  *
