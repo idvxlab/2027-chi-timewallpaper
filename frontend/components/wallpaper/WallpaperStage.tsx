@@ -261,9 +261,9 @@ export function WallpaperStage() {
           position={cameraPositionX}
           disabled={isSubjectInteractionActive}
           onPositionChange={setCameraPositionX}
-          onShortPress={(direction) =>
-            shiftWallpaper(direction === "left" ? -1 : 1)
-          }
+          // NOTE: onShortPress is intentionally omitted. Arrow tap must NOT
+          // navigate wallpaper revisions — horizontal swipe is the only
+          // revision navigation mechanism.
         />
       ) : null}
 

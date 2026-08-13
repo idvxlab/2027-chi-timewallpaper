@@ -213,13 +213,13 @@ function HoldEdge({
       onPointerCancel={onPointerCancel}
       onLostPointerCapture={onPointerCancel}
       onContextMenu={(event) => event.preventDefault()}
-      className={`absolute bottom-20 top-20 z-[55] flex min-w-[52px] max-w-[92px] items-center justify-center bg-transparent transition-opacity ${
+      className={`absolute bottom-20 top-20 z-[55] flex min-w-[56px] min-h-[56px] max-w-[92px] items-center justify-center bg-transparent transition-opacity ${
         isLeft ? "left-0" : "right-0"
       } w-[12%] ${disabled ? "opacity-0" : "opacity-40 hover:opacity-70"}`}
       style={{ touchAction: "none", WebkitTouchCallout: "none" }}
     >
       <span
-        className="relative flex h-11 w-11 items-center justify-center rounded-full bg-black/15 text-2xl text-white backdrop-blur-[2px]"
+        className="relative flex h-14 w-14 items-center justify-center rounded-full bg-black/15 text-3xl text-white backdrop-blur-[2px]"
         style={
           moving
             ? { animation: "panorama-moving-pulse 900ms ease-in-out infinite" }

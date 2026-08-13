@@ -197,6 +197,12 @@ export function useWallpaperVoiceEditRecorder() {
   // the ASR / HTTP / image-generation pipeline can register itself and
   // remove itself on completion.
   const processingJobIdRef = useRef<string>("");
+  // When true, the silence / no_speech / max auto-stop timers do NOT call
+  // finish*Recording for subject_lift captures. This prevents the recorder
+  // from stopping the microphone while the user is still holding the pointer —
+  // in hold-to-record mode, only a real pointerUp should end the capture.
+  // Reset at the start of every new capture.
+  const suppressSubjectLiftAutoStopRef = useRef(false);
   const requestIdRef = useRef("");
   const activeSourceRef = useRef<RecorderSource>("subject_lift");
   // Stable immutable context for the current capture. Written once at
@@ -373,14 +379,24 @@ export function useWallpaperVoiceEditRecorder() {
   );
 
   const processFlashRecording = useCallback(
-    async (blob: Blob, durationMs: number) => {
-      // Freeze context at processing-start so concurrent captures cannot overwrite
-      // it before applyAgentResult reads it asynchronously.
-      const ctx = activeContextRef.current;
+    async (
+      blob: Blob,
+      durationMs: number,
+      forcedCtx?: VoiceProcessingContext | null,
+      forcedJobId?: string,
+    ) => {
+      // Use forced values if provided (from onstop callback with frozen context/jobId).
+      // Otherwise freeze at processing-start so concurrent captures cannot overwrite
+      // it before async cleanup runs.
+      const ctx = forcedCtx !== undefined ? forcedCtx : activeContextRef.current;
+      // Frozen jobId: always use forcedJobId if provided; otherwise freeze from ref.
+      // Async cleanup must NEVER rely on processingJobIdRef.current which may have
+      // been overwritten by a subsequent capture.
+      const jobId = forcedJobId ?? processingJobIdRef.current;
       if (!ctx) {
         console.error("[WallpaperVoiceEdit] processFlashRecording: no active context");
         captureBusyRef.current = false;
-        processingJobsRef.current.delete(processingJobIdRef.current);
+        processingJobsRef.current.delete(jobId);
         syncLifecycleState();
         setStatus("idle");
         return;
@@ -389,12 +405,12 @@ export function useWallpaperVoiceEditRecorder() {
       if (durationMs < profile.minSpeechMs || blob.size < MIN_BLOB_BYTES) {
         console.warn("[WallpaperVoiceEdit] recording too short, please retry");
         captureBusyRef.current = false;
-        processingJobsRef.current.delete(processingJobIdRef.current);
+        processingJobsRef.current.delete(jobId);
         syncLifecycleState();
         setStatus("idle");
         return;
       }
-      processingJobsRef.current.add(processingJobIdRef.current);
+      processingJobsRef.current.add(jobId);
       syncLifecycleState();
       setStatus("editing");
       let queued = false;
@@ -435,9 +451,9 @@ export function useWallpaperVoiceEditRecorder() {
           setInitialInsertStatus("failed");
         }
       } finally {
-        processingJobsRef.current.delete(processingJobIdRef.current);
+        processingJobsRef.current.delete(jobId);
         syncLifecycleState();
-        if (!queued) safeSetIdleIfNoOtherJobs(processingJobIdRef.current);
+        if (!queued) safeSetIdleIfNoOtherJobs(jobId);
       }
     },
     [applyAgentResult, setInitialInsertStatus, setStatus],
@@ -461,7 +477,7 @@ export function useWallpaperVoiceEditRecorder() {
   }, []);
 
   const fallbackStreamToFlash = useCallback(
-    (reason: string) => {
+    (reason: string, jobId: string) => {
       if (streamAsrFinalRef.current || streamFinishedRef.current) return;
       streamFinishedRef.current = true;
       const durationMs = Date.now() - startedAtRef.current;
@@ -470,11 +486,17 @@ export function useWallpaperVoiceEditRecorder() {
       // Clear captureBusyRef: we are abandoning the stream pipeline and transitioning
       // to flash recording. Flash will set up its own MediaRecorder.
       captureBusyRef.current = false;
-      processingJobsRef.current.delete(processingJobIdRef.current);
+      processingJobsRef.current.delete(jobId);
       syncLifecycleState();
       clearTimers();
       cleanupStreamingAudio();
       closeStreamSocket();
+      // Compare-and-clear: only clear if this is still the active capture.
+      // An older callback arriving after a newer capture has already claimed the ref
+      // must NOT overwrite the new capture's identity.
+      if (processingJobIdRef.current === jobId) {
+        processingJobIdRef.current = "";
+      }
       void processFlashRecording(wav, durationMs);
     },
     [clearTimers, cleanupStreamingAudio, closeStreamSocket, processFlashRecording],
@@ -495,7 +517,10 @@ export function useWallpaperVoiceEditRecorder() {
   }, []);
 
   const finishStreamingRecording = useCallback(
-    (reason: "user_stop" | "silence" | "no_speech" | "max" | "error" = "user_stop") => {
+    (
+      reason: "user_stop" | "silence" | "no_speech" | "max" | "error" = "user_stop",
+      jobId?: string,
+    ) => {
       if (endingRef.current || streamFinishedRef.current) return;
       endingRef.current = true;
       console.log("[VOICE] stop_requested reason=stream_finish", { reason });
@@ -520,9 +545,16 @@ export function useWallpaperVoiceEditRecorder() {
       ) {
         if (socket?.readyState === WebSocket.OPEN)
           socket.send(JSON.stringify({ type: "cancel" }));
+        // In this early-return path we use processingJobIdRef.current directly as the
+        // reference for compare-and-clear. Since this guard only fires when the recorder
+        // is already inactive, it is by definition a stale cleanup path.
+        const staleId = processingJobIdRef.current;
         closeStreamSocket();
         captureBusyRef.current = false;
-        processingJobsRef.current.delete(processingJobIdRef.current);
+        processingJobsRef.current.delete(staleId);
+        if (processingJobIdRef.current === staleId) {
+          processingJobIdRef.current = "";
+        }
         syncLifecycleState();
         setStatus("idle");
         return;
@@ -546,14 +578,22 @@ export function useWallpaperVoiceEditRecorder() {
   );
 
   const finishFlashRecording = useCallback(
-    (reason: "user_stop" | "silence" | "no_speech" | "max" | "error" = "user_stop") => {
+    (
+      reason: "user_stop" | "silence" | "no_speech" | "max" | "error" = "user_stop",
+      jobId?: string,
+    ) => {
+      const jobIdToUse = jobId ?? processingJobIdRef.current;
       const recorder = mediaRecorderRef.current;
       if (!recorder || recorder.state === "inactive") {
         // Already inactive: still notify so any visual state can collapse.
         // Complete cleanup so the next startRecording call is not blocked by stale state.
         emitCaptureFinished(reason);
         captureBusyRef.current = false;
-        processingJobsRef.current.delete(processingJobIdRef.current);
+        processingJobsRef.current.delete(jobIdToUse);
+        // Compare-and-clear: only clear if this is still the active capture.
+        if (processingJobIdRef.current === jobIdToUse) {
+          processingJobIdRef.current = "";
+        }
         syncLifecycleState();
         return;
       }
@@ -570,13 +610,20 @@ export function useWallpaperVoiceEditRecorder() {
       mediaRecorderRef.current = null;
       const durationMs = Date.now() - startedAtRef.current;
       setElapsedSec(0);
+      // Capture frozen values in the onstop closure so processFlashRecording
+      // always uses the correct (this-capture) jobId and context — never
+      // the mutable processingJobIdRef.current which may belong to a later capture.
+      const capturedJobId = jobIdToUse;
+      const capturedCtx = activeContextRef.current;
       recorder.onstop = () => {
         recorder.stream.getTracks().forEach((track) => track.stop());
         const blob = new Blob(flashChunksRef.current, {
           type: recorder.mimeType || "audio/webm",
         });
         flashChunksRef.current = [];
-        void processFlashRecording(blob, durationMs);
+        // Pass frozen jobId and ctx so processFlashRecording uses the correct
+        // (this-capture) values regardless of what processingJobIdRef.current is now.
+        void processFlashRecording(blob, durationMs, capturedCtx, capturedJobId);
       };
       try {
         recorder.requestData?.();
@@ -596,6 +643,8 @@ export function useWallpaperVoiceEditRecorder() {
 
   const startFlashRecording = useCallback(
     async (stream: MediaStream) => {
+      // Freeze jobId so the onerror cleanup always uses the correct (this-capture) id.
+      const thisCaptureJobId = processingJobIdRef.current;
       const preferredMime = "audio/webm;codecs=opus";
       const mimeType = window.MediaRecorder.isTypeSupported(preferredMime)
         ? preferredMime
@@ -614,7 +663,11 @@ export function useWallpaperVoiceEditRecorder() {
         mediaRecorderRef.current = null;
         flashChunksRef.current = [];
         captureBusyRef.current = false;
-        processingJobsRef.current.delete(processingJobIdRef.current);
+        processingJobsRef.current.delete(thisCaptureJobId);
+        // Compare-and-clear: only clear if this is still the active capture.
+        if (processingJobIdRef.current === thisCaptureJobId) {
+          processingJobIdRef.current = "";
+        }
         syncLifecycleState();
         setStatus("idle");
       };
@@ -628,15 +681,25 @@ export function useWallpaperVoiceEditRecorder() {
       // Freeze context at streaming-start so concurrent captures cannot overwrite
       // it before the async message handler reads it.
       const ctx = activeContextRef.current;
+      // Freeze the capture id (for identity-comparison only — does NOT claim ownership).
+      // We need this for safe compare-and-clear in the early ctx-null guard path,
+      // which must NOT clobber a later capture's identity if this callback fires stale.
+      const thisCaptureJobId = ctx?.captureId ?? processingJobIdRef.current;
       if (!ctx) {
         console.error("[WallpaperVoiceEdit] startStreamingRecording: no active context");
         closeStreamSocket();
         captureBusyRef.current = false;
-        processingJobsRef.current.delete(processingJobIdRef.current);
+        processingJobsRef.current.delete(thisCaptureJobId);
+        // Compare-and-clear: only clear if this is still the active capture.
+        if (processingJobIdRef.current === thisCaptureJobId) {
+          processingJobIdRef.current = "";
+        }
         syncLifecycleState();
         setStatus("idle");
         return;
       }
+      // thisCaptureJobId is already frozen above from ctx.captureId — reuse it
+      // for the message handler and all its cleanup paths.
       const profile = VOICE_PROFILES[viewerRoleRef.current];
       const socket = new WebSocket(currentWallpaperVoiceStreamUrl());
       streamSocketRef.current = socket;
@@ -679,10 +742,10 @@ export function useWallpaperVoiceEditRecorder() {
             try {
               queued = !applyAgentResult(message.payload, durationMs, ctx);
             } finally {
-              processingJobsRef.current.delete(processingJobIdRef.current);
+              processingJobsRef.current.delete(thisCaptureJobId);
               syncLifecycleState();
               closeStreamSocket();
-              if (!queued) safeSetIdleIfNoOtherJobs(processingJobIdRef.current);
+              if (!queued) safeSetIdleIfNoOtherJobs(thisCaptureJobId);
             }
           } else if (message.type === "error") {
             window.clearTimeout(timeout);
@@ -695,13 +758,17 @@ export function useWallpaperVoiceEditRecorder() {
               !streamAsrFinalRef.current &&
               allPcmRef.current.length > 0
             ) {
-              fallbackStreamToFlash(detail);
+              fallbackStreamToFlash(detail, thisCaptureJobId);
             } else if (!streamAsrFinalRef.current && allPcmRef.current.length === 0) {
               closeStreamSocket();
             } else {
               console.error(`[WallpaperVoiceEdit] ${detail}`);
               captureBusyRef.current = false;
-              processingJobsRef.current.delete(processingJobIdRef.current);
+              processingJobsRef.current.delete(thisCaptureJobId);
+              // Compare-and-clear: only clear if this is still the active capture.
+              if (processingJobIdRef.current === thisCaptureJobId) {
+                processingJobIdRef.current = "";
+              }
               syncLifecycleState();
               clearTimers();
               cleanupStreamingAudio();
@@ -727,7 +794,7 @@ export function useWallpaperVoiceEditRecorder() {
             !streamAsrFinalRef.current &&
             allPcmRef.current.length > 0
           ) {
-            fallbackStreamToFlash("streaming connection closed");
+            fallbackStreamToFlash("streaming connection closed", thisCaptureJobId);
           }
         };
       });
@@ -795,6 +862,17 @@ export function useWallpaperVoiceEditRecorder() {
             now - speechStartedAtRef.current >= profile.minSpeechMs &&
             now - lastSpeechAtRef.current >= adaptiveEndSilenceRef.current
           ) {
+            // Guard: stale callback check — if this callback belongs to a previous capture
+            // (processingJobIdRef.current was overwritten by a later capture), do nothing.
+            if (processingJobIdRef.current !== thisCaptureJobId) return;
+            // Guard: for subject_lift captures, suppress silence auto-stop so
+            // the microphone keeps recording while the user holds the pointer.
+            if (suppressSubjectLiftAutoStopRef.current) {
+              // Subject Lift is active — do NOT stop recording on silence.
+              // Log periodically to confirm the guard is live.
+              console.log("[VOICE] silence_guard_active: not stopping for subject_lift");
+              return;
+            }
             // Logged once when silence-run actually triggers auto-stop.
             console.log("[VOICE] auto_stop_triggered", {
               reason: "silence",
@@ -879,6 +957,11 @@ export function useWallpaperVoiceEditRecorder() {
       // Freeze the immutable context immediately. All async pipeline stages read
       // from activeContextRef — never from mutable global state.
       activeContextRef.current = ctx;
+      // Freeze jobId immediately for all async cleanup paths in this capture.
+      // Freeze capture identity from ctx.captureId — the single source of truth for
+      // this capture. processingJobIdRef.current is set below after all guards pass,
+      // so we use ctx.captureId directly here for the freeze.
+      const thisCaptureJobId = ctx.captureId;
       // Only the real microphone-capture ref is a hard gate. Background
       // generation pipelines (ASR / HTTP / image-edit) do NOT block a
       // brand-new capture — they are tracked via processingJobsRef.
@@ -953,6 +1036,10 @@ export function useWallpaperVoiceEditRecorder() {
         activeContextRef.current = null;
         return false;
       }
+      // Only after all guards pass do we claim the active-capture slot.
+      // This is the sole permitted write to processingJobIdRef.current for
+      // an active capture — it identifies which capture currently holds the microphone.
+      processingJobIdRef.current = thisCaptureJobId;
       activeSourceRef.current = ctx.source;
       const requestedMode =
         ctx.source === "central_button"
@@ -998,9 +1085,10 @@ export function useWallpaperVoiceEditRecorder() {
       streamFinishedRef.current = false;
       streamAsrFinalRef.current = false;
       endingRef.current = false;
-      // Allocate a stable jobId so the downstream generation pipeline can
-      // register itself in processingJobsRef and only remove its own entry.
-      processingJobIdRef.current = ctx.captureId;
+      // Suppress silence/no_speech/max auto-stop when recording for subject_lift.
+      // In hold-to-record mode the user controls when to stop via pointerUp.
+      // Reset every capture so a non-subject_lift capture always gets normal auto-stop.
+      suppressSubjectLiftAutoStopRef.current = ctx.source === "subject_lift";
       captureBusyRef.current = true;
       syncLifecycleState();
       setElapsedSec(0);
@@ -1025,11 +1113,18 @@ export function useWallpaperVoiceEditRecorder() {
           console.error("[VOICE] pipeline start failed", error);
           stream.getTracks().forEach((track) => track.stop());
           captureBusyRef.current = false;
-          processingJobsRef.current.delete(processingJobIdRef.current);
+          processingJobsRef.current.delete(thisCaptureJobId);
           syncLifecycleState();
+          // Compare-and-clear: only clear if this is still the active capture.
+          // An older async callback that arrives after a new capture has already
+          // claimed the ref must NOT overwrite the new capture's identity.
+          if (processingJobIdRef.current === thisCaptureJobId) {
+            processingJobIdRef.current = "";
+          }
           if (!streamFinishedRef.current) {
             fallbackStreamToFlash(
               error instanceof Error ? error.message : String(error),
+              thisCaptureJobId,
             );
           }
           return false;
@@ -1048,12 +1143,32 @@ export function useWallpaperVoiceEditRecorder() {
       timerRef.current = window.setInterval(() => {
         setElapsedSec(Math.round((Date.now() - startedAtRef.current) / 1000));
       }, 200);
+      // Freeze the capture identity so stale timer callbacks cannot stop a later capture.
+      const activeCaptureId = ctx.captureId;
       maxTimerRef.current = window.setTimeout(() => {
+        // Guard: stale timer check — if this callback belongs to a previous capture
+        // (ref.current was overwritten by a later capture), do nothing.
+        if (processingJobIdRef.current !== activeCaptureId) return;
+        // Guard: for subject_lift captures, suppress max-duration auto-stop so
+        // the microphone keeps recording while the user holds the pointer.
+        if (suppressSubjectLiftAutoStopRef.current) {
+          console.log("[VOICE] max_timer_guard_active: not stopping for subject_lift");
+          return;
+        }
         if (activeMode === "stream") finishStreamingRecording("max");
         else finishFlashRecording("max");
       }, profile.maxRecordingMs);
       if (activeMode === "stream") {
         noSpeechTimerRef.current = window.setTimeout(() => {
+          // Guard: stale timer check — if this callback belongs to a previous capture
+          // (ref.current was overwritten by a later capture), do nothing.
+          if (processingJobIdRef.current !== activeCaptureId) return;
+          // Guard: for subject_lift captures, suppress no_speech auto-stop so
+          // the microphone keeps recording while the user holds the pointer.
+          if (suppressSubjectLiftAutoStopRef.current) {
+            console.log("[VOICE] no_speech_timer_guard_active: not stopping for subject_lift");
+            return;
+          }
           if (!speechStartedAtRef.current) finishStreamingRecording("no_speech");
         }, profile.noSpeechTimeoutMs);
       }

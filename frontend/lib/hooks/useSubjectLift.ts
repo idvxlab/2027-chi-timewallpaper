@@ -89,9 +89,9 @@ export type SubjectCutoutCacheEntry = {
   result: SubjectExtractionResult;
   key: string;
   relationshipId: string;
+  revisionId: string;
   wallpaperUrl: string;
   viewerRole: ViewerRole;
-  personRole: PersonRole;
   region: SubjectRegion;
   createdAt: number;
 };
@@ -119,7 +119,7 @@ export function _resetCutoutCacheForTest() {
 }
 
 // ── Cache eviction constants ────────────────────────────────────────────
-const MAX_SUBJECT_CUTOUT_CACHE_ENTRIES = 8;
+const MAX_SUBJECT_CUTOUT_CACHE_ENTRIES = 32;
 const SUBJECT_CUTOUT_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
@@ -172,26 +172,46 @@ function pruneSubjectCutoutCache(currentRelationshipId?: string) {
 }
 
 /**
+ * Normalize a wallpaper URL for cache key use by stripping volatile query/hash
+ * parameters that don't affect the actual image content (e.g. timestamps, cache
+ * busters, signed tokens). Falls back to the full URL if it looks stable.
+ */
+function normalizeWallpaperUrlForCache(url: string): string {
+  try {
+    const u = new URL(url);
+    // Remove query params that are purely cache/timing fingerprints.
+    // Keep the pathname since it contains the stable /generated/<id> identifier.
+    const stripped = ["v", "t", "timestamp", "cb", "cachebust", "token", "sig"];
+    for (const key of [...u.searchParams.keys()]) {
+      if (stripped.includes(key.toLowerCase())) {
+        u.searchParams.delete(key);
+      }
+    }
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+/**
  * Build a unique cache key for a partner cutout.
- * Uses URL as primary identity — each generated wallpaper has a unique immutable
- * filename, so the URL alone distinguishes revisions.  wallpaperVersion is no
- * longer part of the key to avoid stale mismatches during store sync races.
+ * Uses revisionId (when available) as the stable identity of a wallpaper revision.
+ * Falls back to a normalized wallpaperUrl for non-revisioned contexts.
+ * revisionId is preferred because it is immune to URL-level cache-busting params.
  */
 export function buildSubjectCutoutCacheKey(params: {
   relationshipId: string;
+  revisionId: string;
   wallpaperUrl: string;
   viewerRole: ViewerRole;
   personRole: PersonRole;
   region: SubjectRegion;
 }): string {
-  const { relationshipId, wallpaperUrl, viewerRole, personRole, region } = params;
-  return [
-    relationshipId,
-    wallpaperUrl,
-    viewerRole,
-    personRole,
-    region,
-  ].join("::");
+  const { relationshipId, revisionId, wallpaperUrl, viewerRole, personRole, region } =
+    params;
+  // revisionId is the primary stable identity; URL is a fallback for legacy callers.
+  const wallpaperKey = revisionId || normalizeWallpaperUrlForCache(wallpaperUrl);
+  return [relationshipId, wallpaperKey, viewerRole, personRole, region].join("::");
 }
 
 /**
@@ -254,6 +274,7 @@ function getRegionAnchor(region: SubjectRegion): { normalizedX: number; normaliz
  */
 async function getOrRequestPartnerCutout(params: {
   relationshipId: string;
+  revisionId: string;
   wallpaperUrl: string;
   viewerRole: ViewerRole;
   personRole: PersonRole;
@@ -267,11 +288,12 @@ async function getOrRequestPartnerCutout(params: {
   pruneSubjectCutoutCache(params.relationshipId);
   const cached = subjectCutoutCache.get(key);
   if (cached) {
-    console.log("[subject_prefetch] action=cache_hit", {
+    console.log("[SUBJECT_CUTOUT_CACHE] action=hit", {
       key,
       viewerRole: params.viewerRole,
       personRole: params.personRole,
       region: params.region,
+      revisionId: params.revisionId || "url_fallback",
     });
     return cached.result;
   }
@@ -280,18 +302,22 @@ async function getOrRequestPartnerCutout(params: {
   // race conditions when two callers invoke simultaneously.
   const existingInFlight = subjectCutoutInFlight.get(key);
   if (existingInFlight) {
-    console.log("[subject_prefetch] action=join_inflight", { key });
+    console.log("[SUBJECT_CUTOUT_CACHE] action=inflight_join", {
+      key,
+      revisionId: params.revisionId || "url_fallback",
+    });
     const result = await existingInFlight;
     return result;
   }
 
   // 3. Fresh request — build the promise, store it synchronously, THEN await.
   // This ensures a second synchronous caller sees the in-flight entry immediately.
-  console.log("[subject_prefetch] action=start", {
+  console.log("[SUBJECT_CUTOUT_CACHE] action=miss", {
     key,
     viewerRole: params.viewerRole,
     personRole: params.personRole,
     region: params.region,
+    revisionId: params.revisionId || "url_fallback",
   });
 
   const promise = (async () => {
@@ -361,7 +387,13 @@ async function getOrRequestPartnerCutout(params: {
 
   const reasons: string[] = [];
 
-  // URL mismatch = wallpaper content changed
+  // revisionId mismatch = wallpaper revision changed (strongest signal)
+  const currentRevisionId =
+    getSelectedWallpaper(useSceneStore.getState())?.revisionId ?? "";
+  if (currentRevisionId && currentRevisionId !== params.revisionId) {
+    reasons.push("revision_mismatch");
+  }
+  // URL mismatch as a secondary check (handles URL-only fallback path)
   if (currentUrl !== params.wallpaperUrl) {
     reasons.push("url_mismatch");
   }
@@ -387,7 +419,12 @@ async function getOrRequestPartnerCutout(params: {
   // The stale guard for interaction mode is overly restrictive for historical pages.
 
   if (reasons.length > 0) {
-    console.log("[subject_prefetch] action=stale_ignored", { key, staleReason: reasons });
+    console.log("[SUBJECT_CUTOUT_CACHE] action=stale_ignored", {
+      key,
+      staleReason: reasons,
+      currentRevisionId,
+      paramsRevisionId: params.revisionId,
+    });
     throw new StaleSubjectCutoutError(key, reasons);
   }
 
@@ -399,9 +436,9 @@ async function getOrRequestPartnerCutout(params: {
     result,
     key,
     relationshipId: params.relationshipId,
+    revisionId: params.revisionId,
     wallpaperUrl: params.wallpaperUrl,
     viewerRole: params.viewerRole,
-    personRole: params.personRole,
     region: params.region,
     createdAt: Date.now(),
   });
@@ -417,6 +454,10 @@ const LONG_PRESS_MS = 300;
 const MOVE_TOLERANCE_PX = 8;
 // How long an armed subject stays lifted before auto-releasing (10 seconds)
 const ARMED_TIMEOUT_MS = 10_000;
+// Retry delay when recorder start fails transiently (e.g. capture_busy transition)
+const AUTO_RECORD_RETRY_DELAY_MS = 800;
+// Maximum transient retries before giving up (0 = no retry)
+const AUTO_RECORD_MAX_RETRIES = 1;
 // How long to show the releasing animation
 const RELEASING_DURATION_MS = 260;
 // Minimum gap between start-recording event and any stop-recording trigger
@@ -584,6 +625,10 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     isFromHistoricalPage: boolean;
   } | null>(null);
   const autoRecordTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoRecordRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Counts how many transient retries have been attempted for the current armed session.
+  // Reset whenever a new armed session starts (enterArmedLifted).
+  const autoRecordRetryCountRef = useRef(0);
   const armedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Guards the start-recording click from being immediately interpreted as
   // a stop-recording trigger by the global recording-stop listener.
@@ -710,9 +755,12 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     const region = getPartnerRegion(viewerRole);
     const personRole = getPartnerRole(viewerRole);
     const anchor = getRegionAnchor(region);
+    const selectedWallpaper = getSelectedWallpaper(useSceneStore.getState());
+    const revisionId = selectedWallpaper?.revisionId ?? "";
 
     const key = buildSubjectCutoutCacheKey({
       relationshipId,
+      revisionId,
       wallpaperUrl: activeWallpaperUrl,
       viewerRole,
       personRole,
@@ -727,6 +775,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     // Catches StaleSubjectCutoutError to prevent unhandled promise rejection.
     getOrRequestPartnerCutout({
       relationshipId,
+      revisionId,
       wallpaperUrl: activeWallpaperUrl,
       viewerRole,
       personRole,
@@ -741,10 +790,13 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       }
       console.warn("[subject_prefetch] extraction failed", {
         error: err instanceof Error ? err.message : String(err),
+        revisionId,
       });
     });
   }, [
-    // Re-trigger when the wallpaper identity changes (URL is the primary key).
+    // Re-trigger when the wallpaper identity changes.
+    // activeWallpaperUrl covers revision-level changes (each revision has a distinct URL).
+    // revisionId is included as a safety net for any future URL-stable revisions.
     activeWallpaperUrl,
     relationshipId,
     viewerRole,
@@ -822,15 +874,25 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     }
   }, []);
 
+  const clearAutoRecordRetryTimer = useCallback(() => {
+    if (autoRecordRetryTimerRef.current !== null) {
+      clearTimeout(autoRecordRetryTimerRef.current);
+      autoRecordRetryTimerRef.current = null;
+    }
+  }, []);
+
   const cancelPress = useCallback(() => {
     pressSessionIdRef.current = 0;
     recognizedSessionIdRef.current = null;
     clearAutoRecordTimer();
-    // Also clear pointer held state since the press session is cancelled.
-    pointerHeldRef.current = false;
+    clearAutoRecordRetryTimer();
+    // NOTE: pointerHeldRef is NOT cleared here. It is owned exclusively by
+    // real browser pointer events (onPointerDown → true, onPointerUp/onPointerCancel → false).
+    // cancelPress() resets stale session state only — it does NOT represent a real
+    // pointer release, so it must not override the pointer ownership flag.
     // Note: in-flight module-level requests are NOT aborted here.
     // They complete and are guarded by the stale check.
-  }, [clearAutoRecordTimer]);
+  }, [clearAutoRecordTimer, clearAutoRecordRetryTimer]);
 
   const clearArmedTimeout = useCallback(() => {
     if (armedTimeoutRef.current !== null) {
@@ -846,8 +908,9 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   ) => {
     clearArmedTimeout();
     clearAutoRecordTimer();
+    clearAutoRecordRetryTimer();
     transitionState({ status: "releasing", cutoutUrl, bbox, region });
-  }, [clearArmedTimeout, clearAutoRecordTimer]);
+  }, [clearArmedTimeout, clearAutoRecordTimer, clearAutoRecordRetryTimer]);
 
   // ── Start recording ──────────────────────────────────────────────────
   // Clears the 10-second armed timeout, transitions through "starting" while
@@ -948,39 +1011,79 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
 
       if (!ok) {
         console.log(
-          "[SubjectLift] auto-record start failed → releasing",
-          { viewerRole, reason: okReason },
+          "[SubjectLift] auto-record start failed",
+          { viewerRole, reason: okReason, pointerHeld: pointerHeldRef.current },
         );
         // Clear historical voice pending flag since no generation will happen.
         historicalVoicePendingRef.current = null;
 
-        // In hold-to-record mode, if the user is still holding the pointer,
-        // don't force a release. Transition back to armed_lifted so the user
-        // can retry (or keep holding for the recorder to become available).
-        // Only release if the pointer has already been released.
-        if (pointerHeldRef.current) {
-          console.log(
-            "[SubjectLift] recorder start failed but pointer still held — staying in armed_lifted",
+        // Fatal failure: the recorder can never start (permission denied, no microphone,
+        // unsupported browser). These are not retriable. If the user is still holding,
+        // stay lifted and wait for real pointerUp — do NOT auto-release.
+        const isFatal =
+          okReason.includes("permission") ||
+          okReason.includes("microphone") ||
+          okReason.includes("not allowed") ||
+          okReason.includes("not_found") ||
+          okReason.includes("no supported") ||
+          okReason.includes("unsupported");
+        if (isFatal && pointerHeldRef.current) {
+          console.warn(
+            "[SubjectLift] recorder fatal start failure — waiting for pointerUp",
             { reason: okReason },
           );
-          // Transition back to armed_lifted so user can retry when resources clear
+          // Stay in armed_lifted; do NOT enterReleasing().
           if (extractionResultRef.current) {
             transitionState({ status: "armed_lifted", ...extractionResultRef.current });
-          } else {
-            transitionState({ status: "idle" });
           }
           return false;
         }
 
-        // Pointer was already released (abnormal path) — release the lift.
-        if (extractionResultRef.current) {
-          enterReleasing(
-            extractionResultRef.current.cutoutUrl,
-            extractionResultRef.current.bbox,
-            extractionResultRef.current.region,
+        // In hold-to-record mode, if the user is still holding the pointer,
+        // the first failure gets one automatic retry after a short delay.
+        // This handles transient states like capture_busy during a prior cleanup.
+        if (pointerHeldRef.current && autoRecordRetryCountRef.current < AUTO_RECORD_MAX_RETRIES) {
+          autoRecordRetryCountRef.current += 1;
+          console.log(
+            "[SubjectLift] scheduling transient retry",
+            {
+              attempt: autoRecordRetryCountRef.current,
+              maxRetries: AUTO_RECORD_MAX_RETRIES,
+              retryDelayMs: AUTO_RECORD_RETRY_DELAY_MS,
+            },
           );
-        } else {
-          transitionState({ status: "idle" });
+          // Stay in armed_lifted while waiting for retry
+          if (extractionResultRef.current) {
+            transitionState({ status: "armed_lifted", ...extractionResultRef.current });
+          }
+          autoRecordRetryTimerRef.current = setTimeout(() => {
+            // Guard: only retry if still in armed_lifted and pointer still held
+            if (liftStateRef.current.status !== "armed_lifted") {
+              console.log("[SubjectLift] retry skipped: no longer armed_lifted");
+              return;
+            }
+            if (!pointerHeldRef.current) {
+              console.log("[SubjectLift] retry skipped: pointer already released");
+              return;
+            }
+            console.log("[SubjectLift] transient retry fired, retrying recorder start");
+            void doStartRecording();
+          }, AUTO_RECORD_RETRY_DELAY_MS);
+          return false;
+        }
+
+        // Retry exhausted — stay in armed_lifted and wait for real pointerUp.
+        // The user is still holding, so we must NOT force a visual release.
+        // Only enterReleasing when the user actually lets go.
+        autoRecordRetryCountRef.current = 0;
+        console.log(
+          "[SubjectLift] auto-record retry exhausted — waiting for pointerUp",
+          { viewerRole, reason: okReason },
+        );
+        // Stay in armed_lifted. Do NOT call enterReleasing().
+        // The pointerUp handler will handle the release when the user lets go.
+        if (extractionResultRef.current) {
+          transitionState({ status: "armed_lifted", ...extractionResultRef.current });
         }
         return false;
       }
@@ -1056,6 +1159,13 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
 
     clearAutoRecordTimer();
     clearArmedTimeout();
+    // Clear any pending retry timer from a previous armed session.
+    if (autoRecordRetryTimerRef.current !== null) {
+      clearTimeout(autoRecordRetryTimerRef.current);
+      autoRecordRetryTimerRef.current = null;
+    }
+    // Reset retry count for the new armed session.
+    autoRecordRetryCountRef.current = 0;
 
     // Start a "safety" timeout — this only fires if the user somehow got
     // stuck in armed_lifted WITHOUT pointerHeld (e.g. pointercancel fired without
@@ -1190,10 +1300,23 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       return;
     }
 
-    console.log("[api.extractSubject] start", {
-      imageUrl: source.wallpaperUrl,
-      pointX: pt.normalizedX,
-      pointY: pt.normalizedY,
+    // ── Diagnostic log: every real long-press attempt ────────────────────
+    const selectedWallpaper = getSelectedWallpaper(useSceneStore.getState());
+    const dayIndex = useSceneStore.getState().currentDayIndex;
+    const wallpaperIndex = useSceneStore.getState().currentWallpaperIndex;
+    console.log("[SUBJECT_LIFT_ATTEMPT]", {
+      revisionId: source.revisionId,
+      wallpaperUrl: source.wallpaperUrl?.substring(0, 60),
+      dayIndex,
+      wallpaperIndex,
+      canLift,
+      canLiftChecks,
+      region: source.region,
+    });
+
+    console.log("[SUBJECT_EXTRACT_REQUEST]", {
+      revisionId: source.revisionId,
+      relationshipId: source.relationshipId,
       region: source.region,
       viewerRole: source.viewerRole,
     });
@@ -1205,6 +1328,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       // live → POST.  We use the frozen interaction source, not reactive values.
       result = await getOrRequestPartnerCutout({
         relationshipId: source.relationshipId,
+        revisionId: source.revisionId,
         wallpaperUrl: source.wallpaperUrl,
         viewerRole: source.viewerRole,
         personRole: source.personRole,
@@ -1279,6 +1403,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     const sourceKey = interactionSourceRef.current
       ? buildSubjectCutoutCacheKey({
           relationshipId: interactionSourceRef.current.relationshipId,
+          revisionId: interactionSourceRef.current.revisionId,
           wallpaperUrl: interactionSourceRef.current.wallpaperUrl,
           viewerRole: interactionSourceRef.current.viewerRole,
           personRole: interactionSourceRef.current.personRole,
@@ -1287,10 +1412,11 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       : null;
     const wasCached = sourceKey ? subjectCutoutCache.has(sourceKey) : false;
 
-    console.log("[subject_lift_extraction]", {
-      source: wasCached ? "cache" : "live_request",
-      sessionId,
-      region: source?.region,
+    console.log("[SUBJECT_EXTRACT_RESPONSE]", {
+      revisionId: source.revisionId,
+      region: source.region,
+      success: true,
+      cached: wasCached,
       cutoutUrl: result.cutoutUrl.substring(0, 50) + "...",
       bbox: result.bbox,
     });
@@ -1449,17 +1575,18 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
         return;
       }
 
-      // Mark pointer as held — this is cleared on pointerup/pointercancel.
-      // All abnormal release triggers (armed timeout, silence, etc.) MUST check
-      // this flag and only proceed when pointerHeldRef.current === false.
-      pointerHeldRef.current = true;
-
-      // ── Start long press timer ────────────────────────────────────────
-      // Reset the prior session's state BEFORE bumping pressSessionIdRef
-      // so the next press can't inherit a stale extractionResult from the previous session.
+      // ── Reset prior session state first ─────────────────────────────────
+      // This clears stale timers, session IDs, and extraction results from
+      // the previous press. It does NOT modify pointerHeldRef — that flag
+      // is owned exclusively by real pointer events.
       cancelPress();
       extractionResultRef.current = null;
       setHasEnteredRecording(false);
+
+      // ── Then claim pointer ownership for the new press ──────────────────
+      // pointerHeldRef must be set AFTER cancelPress so a new real touch
+      // is never immediately clobbered by cancelPress clearing it.
+      pointerHeldRef.current = true;
       // Always reset the pointer-during-start race flag so that a previous
       // session's stale "true" cannot silently abort the next startRecording.
       pointerReleasedDuringStartRef.current = false;

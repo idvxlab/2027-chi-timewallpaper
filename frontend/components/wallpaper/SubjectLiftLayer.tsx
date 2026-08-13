@@ -748,7 +748,7 @@ function LiftedSubjectVisual({
     transform: "translateY(0)",
     willChange: "transform",
     animation: isRecording
-      ? "subject-lift-record-pulse 1100ms ease-in-out infinite alternate"
+      ? "subject-lift-record-pulse 850ms ease-in-out infinite alternate"
       : "none",
   };
 
@@ -770,10 +770,10 @@ function LiftedSubjectVisual({
         }
         @keyframes subject-lift-record-pulse {
           0% {
-            transform: translateY(-2px);
+            transform: translateY(-6px) scale(1.04);
           }
           100% {
-            transform: translateY(8px);
+            transform: translateY(14px) scale(1.0);
           }
         }
       `}</style>
