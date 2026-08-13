@@ -374,6 +374,7 @@ export const WallpaperCarousel = forwardRef<WallpaperCarouselHandle, Props>(
       <div
         ref={viewportRef}
         className="absolute inset-0 overflow-hidden"
+        style={{ touchAction: "none" }}
         onPointerDownCapture={handlePointerDown}
         onPointerMoveCapture={handlePointerMove}
         onPointerUpCapture={handlePointerUp}
@@ -385,7 +386,11 @@ export const WallpaperCarousel = forwardRef<WallpaperCarouselHandle, Props>(
           style={{
             width: width > 0 ? `${pages.length * 100}%` : undefined,
             willChange: "transform",
-            touchAction: "pan-y",
+            // We own horizontal paging AND vertical handoff (parent
+            // listens to onPointerUp). touchAction: none prevents
+            // Safari from claiming vertical pan and triggering a
+            // pointercancel before our custom gesture routes.
+            touchAction: "none",
           }}
         >
           {pageNodes}

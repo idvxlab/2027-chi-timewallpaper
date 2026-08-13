@@ -291,6 +291,11 @@ export function useHoldAnywhereRecorder({
 
       // Start 2-second timer.
       holdTimerRef.current = window.setTimeout(() => {
+        console.log("[HOLD_ANYWHERE_TIMER_FIRED]", {
+          pointerId: e.pointerId,
+          recordingStartedRefCurrent: recordingStartedRef.current,
+          pointerIdRefCurrent: pointerIdRef.current,
+        });
         if (pointerIdRef.current !== e.pointerId) return;
         if (recordingStartedRef.current) return;
         void beginRecording(e.clientX, e.clientY);

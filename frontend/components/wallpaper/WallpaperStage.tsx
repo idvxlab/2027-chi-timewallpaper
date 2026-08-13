@@ -348,20 +348,23 @@ export function WallpaperStage() {
     if (event.pointerType === "mouse") return;
     const target = event.target;
     // Exclude interactive elements from gesture detection.
-    if (
+    const isInteractive =
       target instanceof Element &&
       target.closest(
         "button, input, textarea, select, [role='button'], [data-panorama-hold-control]",
-      )
-    ) {
-      swipeStartYRef.current = null;
-      swipeStartXRef.current = null;
-      swipeStartXRefOnDownRef.current = null;
-      swipeStartYRefOnDownRef.current = null;
-      voiceGestureActiveRef.current = false;
-      voiceGesturePointerIdRef.current = null;
-      // Notify hold-anywhere too — interactive regions cancel any in-flight hold.
-      holdAnywhere.onPointerUp(event);
+      );
+    console.log("[WALLPAPER_POINTER_DOWN]", {
+      isInteractive: !!isInteractive,
+      tagName: target instanceof Element ? target.tagName : null,
+      pointerType: event.pointerType,
+      pointerId: event.pointerId,
+    });
+    if (isInteractive) {
+      // Pure skip: do not touch the hold-anywhere recorder lifecycle or
+      // carousel gesture state here. The button's own pointer handler
+      // will run on bubble. Calling recorder.onPointerUp() from a
+      // capture-phase non-voice event could otherwise trigger cleanup
+      // side effects on a pointer sequence that the button owns.
       return;
     }
 
@@ -375,8 +378,20 @@ export function WallpaperStage() {
     // region of the wallpaper canvas is a valid hold-anywhere zone).
     // The hook will start a 2s timer internally. If the user keeps holding,
     // it will escalate into a recorder start + halo appearance.
+    console.log("[HOLD_ANYWHERE_GATE]", {
+      enabled: canUseHoldAnywhere,
+      uiMode,
+      hasGeneratedWallpaper,
+      hasAnyWallpaperRevision,
+      wallpaperStateHydrated,
+      showAssets,
+      isSubjectInteractionActive,
+    });
     const claimed = holdAnywhere.onPointerDown(event);
     if (claimed) {
+      console.log("[HOLD_ANYWHERE_CLAIM]", {
+        pointerId: event.pointerId,
+      });
       // Synchronous ownership claim — record both the flag and the
       // pointerId so subsequent pointerUp/pointerCancel can identify
       // this exact sequence even if onSwipeCancel has fired mid-stream.
@@ -389,6 +404,9 @@ export function WallpaperStage() {
       gestureConsumedRef.current = false;
       return;
     }
+    console.log("[HOLD_ANYWHERE_NO_CLAIM]", {
+      pointerId: event.pointerId,
+    });
 
     swipeStartYRef.current = event.clientY;
     swipeStartXRef.current = event.clientX;
@@ -420,6 +438,11 @@ export function WallpaperStage() {
   const handlePointerCancelCapture = (
     event: React.PointerEvent<HTMLDivElement>,
   ) => {
+    console.log("[WALLPAPER_POINTER_CANCEL]", {
+      pointerId: event.pointerId,
+      voiceGestureActiveRef: voiceGestureActiveRef.current,
+      voiceGesturePointerIdRef: voiceGesturePointerIdRef.current,
+    });
     // pointerCancel: system interrupted the pointer sequence (Safari edge case,
     // device rotation, etc.). Treat as user_stop so the mic is released.
     if (
@@ -509,6 +532,7 @@ export function WallpaperStage() {
   return (
     <div
       className="wallpaper-root"
+      style={{ touchAction: "none" }}
       onPointerDownCapture={handlePointerDownCapture}
       onPointerMoveCapture={handlePointerMoveCapture}
       onPointerUpCapture={handlePointerUpCapture}

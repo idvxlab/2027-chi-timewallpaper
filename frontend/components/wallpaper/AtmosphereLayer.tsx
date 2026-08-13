@@ -112,7 +112,15 @@ export function FocusButton({
   return (
     <button
       type="button"
+      onPointerDown={(event) => {
+        console.log("[FOCUS_POINTER_DOWN]", {
+          label,
+          isFocused,
+          className,
+        });
+      }}
       onClick={(event) => {
+        console.log("[FOCUS_CLICK]", { label, isFocused });
         event.stopPropagation();
         onClick();
       }}

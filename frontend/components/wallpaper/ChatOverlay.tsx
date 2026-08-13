@@ -1149,14 +1149,9 @@ export function ChatOverlay() {
         </>
       )}
 
-      {/* Top-left flip toggle; the upper focus/zoom control occupies top-right. */}
-      <button
-        onClick={toggleUiMode}
-        className="absolute left-0 top-0 z-50 h-20 w-20 bg-transparent"
-        aria-label={
-          isWhite ? t("chat.backToWallpaper") : t("chat.openSuggestions")
-        }
-      />
+      {/* Top-left flip toggle removed: AI Summary is now reachable via the
+          vertical-swipe-down gesture on the wallpaper canvas. The legacy
+          floating button is intentionally absent. */}
 
       {/* Floating date pill — hidden on today's latest wallpaper where the
           lock-screen clock is shown instead. Historical days keep the pill. */}

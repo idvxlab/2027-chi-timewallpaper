@@ -34,6 +34,7 @@ export function PanoramaHoldControls({
   const directionRef = useRef<PanoramaDirection | null>(null);
 
   const cancelHold = useCallback(() => {
+    console.log("[PANORAMA_POINTER_UP_OR_CANCEL]", { direction: directionRef.current });
     if (frameRef.current !== null) {
       cancelAnimationFrame(frameRef.current);
       frameRef.current = null;
@@ -54,6 +55,12 @@ export function PanoramaHoldControls({
       direction: PanoramaDirection,
       event: React.PointerEvent<HTMLButtonElement>,
     ) => {
+      console.log("[PANORAMA_POINTER_DOWN]", {
+        direction,
+        disabled,
+        position,
+        isPrimary: event.isPrimary,
+      });
       const alreadyAtEdge =
         direction === "left"
           ? position <= POSITION_EPSILON
