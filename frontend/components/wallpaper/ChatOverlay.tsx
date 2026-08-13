@@ -414,7 +414,11 @@ function OriginalChatHistorySection({
       {/* Scrollable messages */}
       <div
         className="summary-chat-scroll min-h-0 flex-1 overflow-y-auto pr-1"
-        style={{ scrollbarWidth: "thin" }}
+        style={{
+          scrollbarWidth: "thin",
+          WebkitOverflowScrolling: "touch",
+          overflowX: "hidden",
+        }}
       >
         {displayMessages.length === 0 ? (
           <div
@@ -627,7 +631,7 @@ function SummaryChatPreview({
   partnerPortraitUrl: string | null;
 }) {
   const { t } = useI18n();
-  const displayMessages = messages.slice(-4);
+  const displayMessages = messages;
 
   return (
     <section className="mt-[clamp(16px,2.2vh,24px)] flex min-h-[220px] flex-1 flex-col overflow-hidden rounded-[32px] border border-white/90 bg-white/[0.82] px-[clamp(20px,4.5vw,32px)] py-[clamp(18px,2.4vh,28px)] shadow-[0_10px_20px_rgba(69,58,48,0.16)] backdrop-blur-md">
@@ -649,7 +653,14 @@ function SummaryChatPreview({
         {t("chat.originalHistory")}
       </h2>
 
-      <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-2 [scrollbar-width:thin]">
+      <div
+        className="summary-chat-scroll mt-4 min-h-0 flex-1 overflow-y-auto pr-2"
+        style={{
+          scrollbarWidth: "thin",
+          WebkitOverflowScrolling: "touch",
+          overflowX: "hidden",
+        }}
+      >
         {displayMessages.length === 0 ? (
           <div className="flex h-full min-h-[130px] items-center justify-center">
             <p className="text-center text-[clamp(22px,3.8vw,28px)] font-semibold leading-snug text-black/[0.45]">
@@ -685,11 +696,12 @@ function SummaryChatPreview({
                     />
                     <div
                       className={[
-                        "max-w-[76%] rounded-[20px] px-5 py-4 text-[clamp(20px,3.5vw,27px)] font-semibold leading-[1.4] text-[#302b27]",
+                        "inline-block w-fit max-w-[76%] whitespace-pre-wrap break-words rounded-[20px] px-5 py-4 text-[clamp(20px,3.5vw,27px)] font-semibold leading-[1.4] text-[#302b27]",
                         isSelf ? "bg-white/95" : "bg-[#ece8e4]/95",
                       ].join(" ")}
+                      style={{ overflowWrap: "anywhere" }}
                     >
-                      <p className="line-clamp-3">{message.text}</p>
+                      <p>{message.text}</p>
                     </div>
                   </div>
                 </div>

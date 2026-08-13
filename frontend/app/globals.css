@@ -29,3 +29,133 @@ body {
   -webkit-user-select: none;
   -webkit-touch-callout: none;
 }
+
+/* Low-key thin scrollbar for the chat history card on WebKit browsers. */
+.summary-chat-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.summary-chat-scroll::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 999px;
+}
+.summary-chat-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ── Recording Halo ──────────────────────────────────────────────────────── */
+/* White, restrained "Hold Anywhere" recording indicator.                   */
+/* GPU-friendly: only animates transform + opacity.                        */
+
+.halo-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+  background: radial-gradient(
+    circle,
+    rgba(255, 255, 255, 0.06) 0%,
+    rgba(255, 255, 255, 0) 70%
+  );
+  box-shadow:
+    0 0 12px rgba(255, 255, 255, 0.45),
+    0 0 28px rgba(255, 255, 255, 0.18);
+  opacity: 0;
+  transform: scale(0.85);
+}
+
+/* ── Starting: recorder init in flight, very gentle entrance ─────────── */
+.halo-ring--starting {
+  animation: halo-ring-enter 220ms ease-out forwards,
+    halo-pulse-slow 1600ms ease-in-out 220ms infinite;
+}
+
+/* ── Recording: live mic, subtle breathing pulse ─────────────────────── */
+.halo-ring--recording {
+  animation: halo-ring-enter 220ms ease-out forwards,
+    halo-pulse 1000ms ease-in-out 220ms infinite;
+}
+
+/* ── Exiting: pointerUp, fast fade + slight scale-down ──────────────── */
+.halo-ring--exiting {
+  animation: halo-ring-exit 160ms ease-in forwards;
+}
+
+@keyframes halo-ring-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.85);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes halo-ring-exit {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+}
+
+@keyframes halo-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    box-shadow:
+      0 0 12px rgba(255, 255, 255, 0.45),
+      0 0 28px rgba(255, 255, 255, 0.18);
+  }
+  50% {
+    transform: scale(1.08);
+    box-shadow:
+      0 0 16px rgba(255, 255, 255, 0.6),
+      0 0 36px rgba(255, 255, 255, 0.24);
+  }
+}
+
+@keyframes halo-pulse-slow {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.95;
+  }
+  50% {
+    transform: scale(1.04);
+    opacity: 1;
+  }
+}
+
+/* ── Outer ripple (sonar) ────────────────────────────────────────────── */
+.halo-ripple {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.7);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.halo-ripple--starting,
+.halo-ripple--exiting {
+  opacity: 0;
+}
+
+.halo-ripple--recording {
+  animation: halo-ripple-out 1400ms ease-out infinite;
+}
+
+@keyframes halo-ripple-out {
+  0% {
+    opacity: 0.32;
+    transform: scale(0.95);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.7);
+  }
+}

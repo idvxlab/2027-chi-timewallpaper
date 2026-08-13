@@ -213,6 +213,8 @@ export function SubjectLiftLayer({
 
   // ── Lifted cutout display state ─────────────────────────────────────
   const [displayed, setDisplayed] = useState<DisplayedCutout | null>(null);
+  // Reset [SUBJECT_CUTOUT_VISIBLE] gate when falling back to idle/error.
+  const visibleLoggedRef = useRef<boolean>(false);
 
   useEffect(() => {
     if (state.status === "armed_lifted") {
@@ -229,6 +231,13 @@ export function SubjectLiftLayer({
         id: Date.now(),
         loadFailed: false,
       });
+      if (!visibleLoggedRef.current) {
+        visibleLoggedRef.current = true;
+        console.log("[SUBJECT_CUTOUT_VISIBLE]", {
+          cutoutUrl: s.cutoutUrl.substring(0, 50) + "...",
+          timestamp: Date.now(),
+        });
+      }
     } else if (state.status === "starting") {
       // Visual contract: while the recorder pipeline is starting up, the
       // cutout stays exactly where it was in armed_lifted. The animation
@@ -280,6 +289,7 @@ export function SubjectLiftLayer({
       );
     } else if (state.status === "idle" || state.status === "error") {
       setDisplayed(null);
+      visibleLoggedRef.current = false;
     }
   }, [state]);
 

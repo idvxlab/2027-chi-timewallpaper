@@ -1,27 +1,30 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getMemoryObjects, type MemoryObjectItem } from "@/lib/api";
 import { useOnboardingStore } from "@/lib/hooks/useOnboardingStore";
 import {
   getSelectedWallpaper,
-  isLatestWallpaper,
-  isFirstWallpaper,
   useSceneStore,
   DAY_LABELS,
+  TODAY_INDEX,
 } from "@/lib/hooks/useSceneStore";
 import { useWallpaperSync } from "@/lib/hooks/useWallpaperSync";
-import { AtmosphereLayer } from "./AtmosphereLayer";
+import { useHoldAnywhereRecorder } from "@/lib/hooks/useHoldAnywhereRecorder";
+import { AtmosphereOverlay } from "./AtmosphereOverlay";
+import {
+  WallpaperCarousel,
+  type WallpaperCarouselHandle,
+} from "./WallpaperCarousel";
 import { ChatOverlay } from "./ChatOverlay";
 import { MemoryAssetsPanel } from "./MemoryAssetsPanel";
 import { PanoramaHoldControls } from "./PanoramaHoldControls";
 import { PetalMotionLayer } from "./PetalMotionLayer";
-import { SubjectLiftLayer } from "./SubjectLiftLayer";
+import { RecordingHalo } from "./RecordingHalo";
 import { useI18n } from "@/lib/i18n";
 import { subscribeToWallpaperEvents } from "@/lib/wallpaperEvents";
 
 const SWIPE_THRESHOLD = 70;
-const PAGE_TRANSITION_MS = 220;
 
 export function WallpaperStage() {
   useWallpaperSync();
@@ -31,9 +34,6 @@ export function WallpaperStage() {
   const uiMode = useSceneStore((s) => s.uiMode);
   const focusMode = useSceneStore((s) => s.focusMode);
   const selectedWallpaper = useSceneStore(getSelectedWallpaper);
-  const isLatest = useSceneStore(isLatestWallpaper);
-  const isFirst = useSceneStore(isFirstWallpaper);
-  const shiftWallpaper = useSceneStore((s) => s.shiftWallpaper);
   const wallpapersByDay = useSceneStore((s) => s.wallpapersByDay);
   const toggleUiMode = useSceneStore((s) => s.toggleUiMode);
   const [showAssets, setShowAssets] = useState(false);
@@ -44,21 +44,50 @@ export function WallpaperStage() {
     useState(false);
   const [cameraPositionX, setCameraPositionX] = useState(0.5);
 
-  // ── Swipe gesture state ────────────────────────────────────────────
-  const swipeStartYRef = useRef<number | null>(null);
-  const swipeStartXRef = useRef<number | null>(null);
-  // Guards against a single pointer sequence being consumed by multiple actions.
-  const gestureConsumedRef = useRef(false);
+  // ── Hold-Anywhere Voice Gesture ──────────────────────────────────
+  // Replaces the previous Subject Lift pointer path. SubjectLiftLayer
+  // is left in the codebase (dormant) for future use; this hook is the
+  // authoritative voice gesture for the test build.
+  const holdAnywhere = useHoldAnywhereRecorder({
+    subjectLiftHeld: isSubjectInteractionActive,
+    uiMode,
+    onSwipeCancel: (pointerId) => {
+      // The user clearly swiped horizontally; hand the gesture to the
+      // carousel. We must clear voice ownership SYNCHRONOUSLY here so
+      // the very next pointerMove in the same event sequence is
+      // treated as a carousel drag.
+      voiceGestureActiveRef.current = false;
+      voiceGesturePointerIdRef.current = null;
+      swipeStartXRef.current = swipeStartXRefOnDownRef.current;
+      swipeStartYRef.current = swipeStartYRefOnDownRef.current;
+      gestureConsumedRef.current = false;
+      console.log(
+        "[WallpaperStage] hold→carousel handoff (pointerId=",
+        pointerId,
+        ")",
+      );
+    },
+  });
+  // Capture pointerDown coords here so the swipe-cancel callback can
+  // hand them to the carousel even if hold-anywhere already reset its
+  // own copies.
+  const swipeStartXRefOnDownRef = useRef<number | null>(null);
+  const swipeStartYRefOnDownRef = useRef<number | null>(null);
+  const [haloVisible, setHaloVisible] = useState(false);
+  const [haloPhase, setHaloPhase] = useState<"starting" | "recording" | "exiting">(
+    "starting",
+  );
+  const exitTimerRef = useRef<number | null>(null);
 
-  // ── Page transition animation ──────────────────────────────────────
-  const [pageTransition, setPageTransition] = useState<
-    "idle" | "exiting" | "entering"
-  >("idle");
-  const transitionDirectionRef = useRef<"next" | "prev">("next");
-  const transitionTimerRef = useRef<number | null>(null);
+  // ── Carousel handle (page data lives after availableWallpapers below) ──
+  const setSelectedRevision = useSceneStore((s) => s.setSelectedRevision);
+  const carouselRef = useRef<WallpaperCarouselHandle>(null);
 
   // ── Computed: flat list of wallpapers with real history ─────────────
-  const availableWallpapers = (() => {
+  // NEWEST first: today → yesterday → ... → 6天前. The carousel renders
+  // them in this order so swiping LEFT (deltaX < 0) goes to OLDER
+  // revisions, mirroring Apple's Photos / iOS Pages apps.
+  const availableWallpapers = useMemo(() => {
     const result: Array<{ dayIndex: number; wallpaperIndex: number }> = [];
     for (let d = DAY_LABELS.length - 1; d >= 0; d--) {
       const dayItems = wallpapersByDay[DAY_LABELS[d]];
@@ -68,7 +97,7 @@ export function WallpaperStage() {
       }
     }
     return result;
-  })();
+  }, [wallpapersByDay]);
 
   const currentDayIndex = useSceneStore((s) => s.currentDayIndex);
   const currentWallpaperIndex = useSceneStore((s) => s.currentWallpaperIndex);
@@ -77,6 +106,62 @@ export function WallpaperStage() {
       p.dayIndex === currentDayIndex &&
       p.wallpaperIndex === currentWallpaperIndex,
   );
+
+  const generatedWallpaperUrl = useSceneStore((s) => s.generatedWallpaperUrl);
+
+  const carouselPages = useMemo(() => {
+    return availableWallpapers.map((entry, visualIndex) => {
+      const day = wallpapersByDay[DAY_LABELS[entry.dayIndex]] ?? [];
+      const item = day[entry.wallpaperIndex];
+      // First page (visualIndex === 0) is the LATEST revision.
+      // For the latest revision, prefer the live generated URL so the
+      // most recent generation is visible without waiting for any sync.
+      const isLatestRevision =
+        entry.dayIndex === TODAY_INDEX && entry.wallpaperIndex === 0;
+      const imageUrl =
+        isLatestRevision && generatedWallpaperUrl
+          ? generatedWallpaperUrl
+          : item?.imageUrl || "";
+      return {
+        key: item?.revisionId || `${entry.dayIndex}:${entry.wallpaperIndex}`,
+        imageUrl,
+        visualIndex,
+        // Per-page metadata so onPageSettled can commit the right revision.
+        dayIndex: entry.dayIndex,
+        wallpaperIndex: entry.wallpaperIndex,
+      };
+    });
+  }, [availableWallpapers, wallpapersByDay, generatedWallpaperUrl]);
+
+  // Clamp currentPageIndex for the carousel. If the store points at a
+  // revision that disappeared (e.g. transient empty bucket), default to 0.
+  const safeCarouselIndex =
+    currentPageIndex >= 0 && currentPageIndex < carouselPages.length
+      ? currentPageIndex
+      : 0;
+
+  // ── Swipe gesture state ────────────────────────────────────────────
+  const swipeStartYRef = useRef<number | null>(null);
+  const swipeStartXRef = useRef<number | null>(null);
+  // Guards against a single pointer sequence being consumed by multiple actions.
+  const gestureConsumedRef = useRef(false);
+
+  // ── Voice gesture ownership (synchronous, event-handler driven) ──
+  // TRUE means the current pointer sequence is owned by the voice gesture
+  // (hold-anywhere). The carousel / vertical gesture code must yield.
+  // Set synchronously in handlePointerDownCapture when holdAnywhere claims
+  // the gesture; reset in pointerUp / pointerCancel / onSwipeCancel.
+  // MUST NOT be mutated inside a useEffect — see handler comments.
+  const voiceGestureActiveRef = useRef(false);
+
+  // Mirror that captures the voice gesture's *exact* pointerDown coordinates
+  // (not whatever the carousel's swipeStartXRef currently holds, since the
+  // carousel swipeStart was cleared while hold-anywhere was the owner).
+  const voiceGesturePointerIdRef = useRef<number | null>(null);
+
+  // ── Page transition animation (removed: now handled by WallpaperCarousel) ──
+  // No pageTransition state here. The carousel commits store index from
+  // its own transitionend, with the visual track already aligned.
 
   const loadAssets = useCallback(async () => {
     if (!userContext) {
@@ -126,14 +211,41 @@ export function WallpaperStage() {
     setCameraPositionX(0.5);
   }, [selectedWallpaper?.revisionId]);
 
-  // Cancel any pending page transition when wallpaper changes.
+  // ── Halo visibility tied to hold-anywhere state machine ────────────
   useEffect(() => {
-    if (transitionTimerRef.current) {
-      clearTimeout(transitionTimerRef.current);
-      transitionTimerRef.current = null;
+    if (exitTimerRef.current !== null) {
+      window.clearTimeout(exitTimerRef.current);
+      exitTimerRef.current = null;
     }
-    setPageTransition("idle");
-  }, [selectedWallpaper?.revisionId]);
+    const status = holdAnywhere.state.status;
+    if (status === "hold_pending" || status === "recording") {
+      setHaloVisible(true);
+      setHaloPhase(status === "recording" ? "recording" : "starting");
+      setIsSubjectInteractionActive(true);
+    } else if (status === "idle") {
+      if (haloVisible) {
+        setHaloPhase("exiting");
+        exitTimerRef.current = window.setTimeout(() => {
+          setHaloVisible(false);
+          exitTimerRef.current = null;
+        }, 200);
+      }
+      setIsSubjectInteractionActive(false);
+    }
+    return () => {
+      if (exitTimerRef.current !== null) {
+        window.clearTimeout(exitTimerRef.current);
+        exitTimerRef.current = null;
+      }
+    };
+  }, [holdAnywhere.state.status, haloVisible]);
+  // NOTE: voiceGestureActiveRef.current is NEVER mutated from a useEffect.
+  // It is owned by the pointer event handlers below so the gesture
+  // ownership check is synchronous within the same event cycle.
+
+  // When the store's selected wallpaper changes from outside (e.g. a brand
+  // new wallpaper arrived via SSE), the WallpaperCarousel's `initialIndex`
+  // prop already follows it and re-aligns without animation. Nothing to do.
 
   const foregroundHidden = focusMode !== "balanced";
 
@@ -156,16 +268,109 @@ export function WallpaperStage() {
     ) {
       swipeStartYRef.current = null;
       swipeStartXRef.current = null;
+      swipeStartXRefOnDownRef.current = null;
+      swipeStartYRefOnDownRef.current = null;
+      voiceGestureActiveRef.current = false;
+      voiceGesturePointerIdRef.current = null;
+      // Notify hold-anywhere too — interactive regions cancel any in-flight hold.
+      holdAnywhere.onPointerUp(event);
       return;
     }
+
+    // Always remember the original pointerDown coords so the carousel
+    // can take over after a swipe-cancel from hold-anywhere, or so voice
+    // gesture can know its origin.
+    swipeStartXRefOnDownRef.current = event.clientX;
+    swipeStartYRefOnDownRef.current = event.clientY;
+
+    // First, attempt to claim the gesture for hold-anywhere (any non-control
+    // region of the wallpaper canvas is a valid hold-anywhere zone).
+    // The hook will start a 2s timer internally. If the user keeps holding,
+    // it will escalate into a recorder start + halo appearance.
+    const claimed = holdAnywhere.onPointerDown(event);
+    if (claimed) {
+      // Synchronous ownership claim — record both the flag and the
+      // pointerId so subsequent pointerUp/pointerCancel can identify
+      // this exact sequence even if onSwipeCancel has fired mid-stream.
+      voiceGestureActiveRef.current = true;
+      voiceGesturePointerIdRef.current = event.pointerId;
+      // Defer carousel / vertical-gesture bookkeeping until we know
+      // whether the hold resolves into a recording or a swipe.
+      swipeStartYRef.current = null;
+      swipeStartXRef.current = null;
+      gestureConsumedRef.current = false;
+      return;
+    }
+
     swipeStartYRef.current = event.clientY;
     swipeStartXRef.current = event.clientX;
     gestureConsumedRef.current = false;
   };
 
+  const handlePointerMoveCapture = (
+    event: React.PointerEvent<HTMLDivElement>,
+  ) => {
+    // Voice gesture owns this pointer → suppress carousel/vertical gestures
+    // entirely (synchronous ref check; no useEffect dependency).
+    if (
+      voiceGestureActiveRef.current &&
+      voiceGesturePointerIdRef.current === event.pointerId
+    ) {
+      // Still feed into the hook so its own swipe detection can cancel the
+      // hold if the user clearly swipes. When it does, it will call
+      // onSwipeCancel → we synchronously reset the ref below.
+      holdAnywhere.onPointerMove(event);
+      return;
+    }
+
+    // Always feed move events into hold-anywhere so its internal swipe
+    // detector can cancel a pending hold. This is independent of the
+    // carousel bookkeeping below.
+    holdAnywhere.onPointerMove(event);
+  };
+
+  const handlePointerCancelCapture = (
+    event: React.PointerEvent<HTMLDivElement>,
+  ) => {
+    // pointerCancel: system interrupted the pointer sequence (Safari edge case,
+    // device rotation, etc.). Treat as user_stop so the mic is released.
+    if (
+      voiceGestureActiveRef.current &&
+      voiceGesturePointerIdRef.current === event.pointerId
+    ) {
+      holdAnywhere.onPointerUp(event);
+      voiceGestureActiveRef.current = false;
+      voiceGesturePointerIdRef.current = null;
+      return;
+    }
+    // Even if voice never owned this sequence, still notify hold-anywhere
+    // so its internal pointerId bookkeeping is consistent.
+    holdAnywhere.onPointerUp(event);
+  };
+
   const handlePointerUpCapture = (
     event: React.PointerEvent<HTMLDivElement>,
   ) => {
+    // Voice owns this pointer → only handle stop, suppress carousel.
+    if (
+      voiceGestureActiveRef.current &&
+      voiceGesturePointerIdRef.current === event.pointerId
+    ) {
+      holdAnywhere.onPointerUp(event);
+      voiceGestureActiveRef.current = false;
+      voiceGesturePointerIdRef.current = null;
+      // Clear swipe refs to ensure no further pointerMove in the same
+      // sequence can accidentally act as a carousel swipe.
+      swipeStartXRef.current = null;
+      swipeStartYRef.current = null;
+      return;
+    }
+
+    // Not voice-owned (or pointerId mismatch): notify hold-anywhere on every
+    // pointer up. If the hook was already cancelled by an internal swipe
+    // detection, this is a no-op.
+    holdAnywhere.onPointerUp(event);
+
     const startY = swipeStartYRef.current;
     const startX = swipeStartXRef.current;
     swipeStartYRef.current = null;
@@ -201,56 +406,64 @@ export function WallpaperStage() {
       return;
     }
 
-    // ── Horizontal gesture ────────────────────────────────────────
-    const isHorizontalGesture =
-      Math.abs(deltaX) > Math.abs(deltaY) * 1.25;
-    if (
-      isHorizontalGesture &&
-      Math.abs(deltaX) >= SWIPE_THRESHOLD &&
-      !showAssets &&
-      uiMode === "wallpaper"
-    ) {
-      // Subject Lift active → suppress page navigation.
-      if (isSubjectInteractionActive) return;
-      if (gestureConsumedRef.current) return;
-
-      gestureConsumedRef.current = true;
-      const dir = deltaX < 0 ? 1 : -1;
-      transitionDirectionRef.current = dir < 0 ? "next" : "prev";
-      setPageTransition("exiting");
-      if (transitionTimerRef.current !== null) {
-        clearTimeout(transitionTimerRef.current);
-      }
-      transitionTimerRef.current = window.setTimeout(() => {
-        shiftWallpaper(dir);
-        setPageTransition("entering");
-        transitionTimerRef.current = window.setTimeout(() => {
-          setPageTransition("idle");
-          transitionTimerRef.current = null;
-        }, PAGE_TRANSITION_MS);
-      }, PAGE_TRANSITION_MS);
-    }
+    // ── Horizontal gesture paging ────────────────────────────────────────
+    // Carousel paging is owned by WallpaperCarousel itself. This handler
+    // intentionally does nothing for horizontal gestures — the carousel's
+    // own capture-phase pointer listeners run on the same root div and
+    // will handle the drag, snap, and store commit.
   };
 
   return (
     <div
       className="wallpaper-root"
       onPointerDownCapture={handlePointerDownCapture}
+      onPointerMoveCapture={handlePointerMoveCapture}
       onPointerUpCapture={handlePointerUpCapture}
+      onPointerCancelCapture={handlePointerCancelCapture}
     >
-      <AtmosphereLayer
+      {/* True translate3d Apple-like carousel — every available wallpaper
+          is a stable mounted page. Snap animation drives store commit. */}
+      <WallpaperCarousel
+        ref={carouselRef}
+        pages={carouselPages}
+        initialIndex={safeCarouselIndex}
+        enabled={!isSubjectInteractionActive && uiMode === "wallpaper" && !showAssets}
+        onPageSettled={(visualIndex) => {
+          const page = carouselPages[visualIndex];
+          if (!page) return;
+          setSelectedRevision(page.dayIndex, page.wallpaperIndex);
+          console.log(
+            "[Carousel] settled →",
+            visualIndex,
+            "day=",
+            page.dayIndex,
+            "wall=",
+            page.wallpaperIndex,
+          );
+        }}
+        onDrag={() => {
+          // While dragging, suppress motion layers to save GPU.
+        }}
+        onDragChange={(active) => {
+          // Reflect drag state into isSubjectInteractionActive so motion
+          // / panorama controls pause while user is paging. We use
+          // prev || active because the voice gesture's useEffect will
+          // eventually clear the flag when recording finishes, and we
+          // don't want a transient drag-end to clear it prematurely.
+          setIsSubjectInteractionActive((prev) => prev || active);
+        }}
+      />
+      <AtmosphereOverlay
         motionPaused={isSubjectInteractionActive}
         cameraPositionX={cameraPositionX}
-        pageTransition={pageTransition}
-        transitionDirection={transitionDirectionRef.current}
       />
       <PetalMotionLayer
         hidden={foregroundHidden}
         motionPaused={foregroundHidden || isSubjectInteractionActive}
       />
-      <SubjectLiftLayer
-        onInteractionActiveChange={setIsSubjectInteractionActive}
-      />
+      {/* SubjectLiftLayer intentionally not rendered in this build.
+          The voice gesture is now "Hold Anywhere" (see useHoldAnywhereRecorder).
+          The component file remains dormant for future restoration. */}
       <ChatOverlay />
 
       {!showAssets &&
@@ -330,6 +543,16 @@ export function WallpaperStage() {
           onAssetSelect={(asset) => {
             console.log("[MemoryAssets] selected", asset.assetId, asset.name);
           }}
+        />
+      ) : null}
+
+      {/* Hold-Anywhere voice recording halo.
+          Viewport-anchored so it is independent of the carousel transform. */}
+      {haloVisible ? (
+        <RecordingHalo
+          clientX={holdAnywhere.state.clientX}
+          clientY={holdAnywhere.state.clientY}
+          phase={haloPhase}
         />
       ) : null}
     </div>

@@ -98,7 +98,7 @@ function FocusToggleIcon({ isFocused }: { isFocused: boolean }) {
   );
 }
 
-function FocusButton({
+export function FocusButton({
   isFocused,
   label,
   className,

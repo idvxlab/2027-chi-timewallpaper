@@ -37,7 +37,10 @@ export type WallpaperVoiceEditStatus =
 
 export type ViewerRole = "child" | "elder";
 export type VoiceAsrMode = "flash" | "stream";
-export type RecorderSource = "central_button" | "subject_lift";
+export type RecorderSource =
+  | "central_button"
+  | "subject_lift"
+  | "hold_anywhere";
 
 /**
  * Immutable context for one voice capture → processing pipeline. Created once
@@ -460,14 +463,42 @@ export function useWallpaperVoiceEditRecorder() {
   );
 
   const cleanupStreamingAudio = useCallback(() => {
+    const mediaRef = streamMediaRef.current;
+    const ctxRef = audioContextRef.current;
+    const tracksBefore =
+      mediaRef?.getTracks().map((t) => ({
+        readyState: t.readyState,
+        enabled: t.enabled,
+        muted: t.muted,
+        kind: t.kind,
+      })) ?? [];
+    const jobId = processingJobIdRef.current;
+    console.log("[VOICE_MIC_RELEASE]", {
+      mode: "stream",
+      captureId: jobId,
+      tracksBefore,
+      audioContextStateBefore: ctxRef?.state,
+    });
     processorRef.current?.disconnect();
     sourceRef.current?.disconnect();
-    streamMediaRef.current?.getTracks().forEach((track) => track.stop());
+    mediaRef?.getTracks().forEach((track) => track.stop());
     void audioContextRef.current?.close().catch(() => undefined);
     processorRef.current = null;
     sourceRef.current = null;
     streamMediaRef.current = null;
     audioContextRef.current = null;
+    queueMicrotask(() => {
+      console.log("[VOICE_MIC_RELEASE] post", {
+        mode: "stream",
+        captureId: jobId,
+      });
+    });
+    window.setTimeout(() => {
+      console.log("[VOICE_MIC_RELEASE] +100ms", {
+        mode: "stream",
+        captureId: jobId,
+      });
+    }, 100);
   }, []);
 
   const closeStreamSocket = useCallback(() => {
@@ -616,7 +647,36 @@ export function useWallpaperVoiceEditRecorder() {
       const capturedJobId = jobIdToUse;
       const capturedCtx = activeContextRef.current;
       recorder.onstop = () => {
+        const tracksAfter = recorder.stream
+          .getTracks()
+          .map((t) => ({
+            readyState: t.readyState,
+            enabled: t.enabled,
+            muted: t.muted,
+            kind: t.kind,
+          }));
+        console.log("[VOICE_MIC_RELEASE]", {
+          mode: "flash",
+          captureId: capturedJobId,
+          mediaRecorderStateBefore: recorder.state,
+          tracksBeforeStop: tracksAfter,
+        });
         recorder.stream.getTracks().forEach((track) => track.stop());
+        queueMicrotask(() => {
+          console.log("[VOICE_MIC_RELEASE] post", {
+            mode: "flash",
+            captureId: capturedJobId,
+            tracksAfter: recorder.stream
+              .getTracks()
+              .map((t) => ({ readyState: t.readyState })),
+          });
+        });
+        window.setTimeout(() => {
+          console.log("[VOICE_MIC_RELEASE] +100ms", {
+            mode: "flash",
+            captureId: capturedJobId,
+          });
+        }, 100);
         const blob = new Blob(flashChunksRef.current, {
           type: recorder.mimeType || "audio/webm",
         });
@@ -870,7 +930,7 @@ export function useWallpaperVoiceEditRecorder() {
             if (suppressSubjectLiftAutoStopRef.current) {
               // Subject Lift is active — do NOT stop recording on silence.
               // Log periodically to confirm the guard is live.
-              console.log("[VOICE] silence_guard_active: not stopping for subject_lift");
+              console.log("[VOICE] silence_guard_active: not stopping for hold-to-record");
               return;
             }
             // Logged once when silence-run actually triggers auto-stop.
@@ -994,16 +1054,24 @@ export function useWallpaperVoiceEditRecorder() {
         }
         // Central button: require initial_voice/processing mode
       } else {
-        const interactionMode = getWallpaperInteractionMode(scene);
-        if (
-          interactionMode !== "initial_voice" &&
-          interactionMode !== "processing"
-        ) {
-          console.warn(
-            `[VOICE] start_rejected: ${ctx.source} mode=${interactionMode}`,
-          );
-          activeContextRef.current = null;
-          return false;
+        // hold_anywhere: allowed on any page (including historical) because
+        // the generation base is always the latest shared wallpaper (not the
+        // currently viewed historical revision). The generation pipeline
+        // determines base revision independently of isFromHistoricalPage.
+        if (ctx.source === "hold_anywhere") {
+          // No interaction-mode restriction; proceed to microphone start.
+        } else {
+          const interactionMode = getWallpaperInteractionMode(scene);
+          if (
+            interactionMode !== "initial_voice" &&
+            interactionMode !== "processing"
+          ) {
+            console.warn(
+              `[VOICE] start_rejected: ${ctx.source} mode=${interactionMode}`,
+            );
+            activeContextRef.current = null;
+            return false;
+          }
         }
       }
 
@@ -1087,8 +1155,9 @@ export function useWallpaperVoiceEditRecorder() {
       endingRef.current = false;
       // Suppress silence/no_speech/max auto-stop when recording for subject_lift.
       // In hold-to-record mode the user controls when to stop via pointerUp.
-      // Reset every capture so a non-subject_lift capture always gets normal auto-stop.
-      suppressSubjectLiftAutoStopRef.current = ctx.source === "subject_lift";
+      // Reset every capture so a non-hold-to-record capture always gets normal auto-stop.
+      suppressSubjectLiftAutoStopRef.current =
+        ctx.source === "subject_lift" || ctx.source === "hold_anywhere";
       captureBusyRef.current = true;
       syncLifecycleState();
       setElapsedSec(0);
@@ -1152,7 +1221,7 @@ export function useWallpaperVoiceEditRecorder() {
         // Guard: for subject_lift captures, suppress max-duration auto-stop so
         // the microphone keeps recording while the user holds the pointer.
         if (suppressSubjectLiftAutoStopRef.current) {
-          console.log("[VOICE] max_timer_guard_active: not stopping for subject_lift");
+          console.log("[VOICE] max_timer_guard_active: not stopping for hold-to-record");
           return;
         }
         if (activeMode === "stream") finishStreamingRecording("max");
@@ -1166,7 +1235,7 @@ export function useWallpaperVoiceEditRecorder() {
           // Guard: for subject_lift captures, suppress no_speech auto-stop so
           // the microphone keeps recording while the user holds the pointer.
           if (suppressSubjectLiftAutoStopRef.current) {
-            console.log("[VOICE] no_speech_timer_guard_active: not stopping for subject_lift");
+            console.log("[VOICE] no_speech_timer_guard_active: not stopping for hold-to-record");
             return;
           }
           if (!speechStartedAtRef.current) finishStreamingRecording("no_speech");

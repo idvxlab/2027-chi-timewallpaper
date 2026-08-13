@@ -163,6 +163,9 @@ type State = {
   currentDayIndex: number;
   setCurrentDayIndex: (index: number) => void;
   currentWallpaperIndex: number;
+  /** Set the active revision directly by (dayIndex, wallpaperIndex).
+   *  Used by WallpaperCarousel after a successful snap commit. */
+  setSelectedRevision: (dayIndex: number, wallpaperIndex: number) => void;
   wallpapersByDay: WallpapersByDay;
   setWallpaperRevisions: (items: WallpaperItem[]) => void;
   setWallpaperInteractions: (items: WallpaperInteractionItem[]) => void;
@@ -271,7 +274,8 @@ export type InteractionMode =
   | "history_disabled"
   | "initial_voice"
   | "processing"
-  | "subject_lift";
+  | "subject_lift"
+  | "hold_anywhere";
 
 export type WallpaperInteractionState = Pick<
   State,
@@ -308,8 +312,8 @@ export function getWallpaperInteractionMode(
     return "processing";
   }
 
-  // First voice done — full shared wallpaper.
-  return "subject_lift";
+  // First voice done — hold-anywhere voice recording is the primary interaction.
+  return "hold_anywhere";
 }
 
 export const useSceneStore = create<State>((set, get) => ({
@@ -333,6 +337,17 @@ export const useSceneStore = create<State>((set, get) => ({
         focusMode: "balanced",
       });
     }
+  },
+  setSelectedRevision(dayIndex: number, wallpaperIndex: number) {
+    if (dayIndex < 0 || dayIndex >= DAY_LABELS.length) return;
+    const label = DAY_LABELS[dayIndex];
+    const items = get().wallpapersByDay[label] ?? [];
+    if (wallpaperIndex < 0 || wallpaperIndex >= items.length) return;
+    set({
+      currentDayIndex: dayIndex,
+      currentWallpaperIndex: wallpaperIndex,
+      focusMode: "balanced",
+    });
   },
   messagesByDay: loadMessages(),
 
