@@ -62,6 +62,7 @@ import {
   type SubjectRegion,
   type PersonRole,
 } from "@/lib/subjectGeometry";
+import { type VoiceProcessingContext } from "@/lib/hooks/useWallpaperVoiceEditRecorder";
 import { getWallpaperDisplayGeometry } from "@/lib/wallpaperDisplayGeometry";
 import {
   getSelectedWallpaper,
@@ -518,39 +519,45 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   );
 
   const recorder = useWallpaperVoiceEditRecorder();
-  const { status: voiceStatus, subscribeGenerationSuccess } = recorder;
+  const {
+    status: voiceStatus,
+    subscribeGenerationSuccess,
+    captureBusy,
+    getCurrentCaptureId,
+  } = recorder;
 
   // Subscribe to generation success events for historical auto-jump.
+  // The event carries the full immutable context (captureId, relationshipId,
+  // isFromHistoricalPage). When isFromHistoricalPage=true and eventSeq>0,
+  // set expectedJumpEventSeq. No single historicalVoicePendingRef is needed —
+  // each event carries its own attribution.
   useEffect(() => {
-    const unsubscribe = subscribeGenerationSuccess((eventSeq: number) => {
-      const pending = historicalVoicePendingRef.current;
-      if (pending && eventSeq > 0) {
-        console.log("[SubjectLift] generation success, setting expected eventSeq", {
-          eventSeq,
-          relId: pending.relationshipId,
-        });
-        useSceneStore.getState().setExpectedJumpEventSeq(eventSeq, pending.relationshipId);
-      }
-      // Consume the flag regardless of whether it was set
-      historicalVoicePendingRef.current = null;
-    });
+    const unsubscribe = subscribeGenerationSuccess(
+      ({ eventSeq, captureId: _captureId, relationshipId, isFromHistoricalPage }) => {
+        console.log(
+          "[SubjectLift] generation success event",
+          { eventSeq, relationshipId, isFromHistoricalPage },
+        );
+        if (isFromHistoricalPage && eventSeq > 0) {
+          console.log(
+            "[SubjectLift] historical page success, setting expected eventSeq",
+            { eventSeq, relationshipId },
+          );
+          useSceneStore.getState().setExpectedJumpEventSeq(eventSeq, relationshipId);
+        }
+      },
+    );
     return unsubscribe;
   }, [subscribeGenerationSuccess]);
 
-  // Clear historicalVoicePendingRef on terminal idle state.
-  // This catches all failure paths that don't emit generation success:
-  // - too short recording
-  // - ASR failure
-  // - HTTP error
-  // - generation error
-  // - timeout/cancellation
-  // When voiceStatus returns to "idle" after being non-idle, clear any stale pending flag.
+  // When a new microphone capture begins, clear any pending jump expectations.
+  // The next generation (if from a historical page) will set a fresh expectation.
   useEffect(() => {
-    if (voiceStatus === "idle" && historicalVoicePendingRef.current) {
-      console.log("[SubjectLift] voice returned to idle without success, clearing pending");
-      historicalVoicePendingRef.current = null;
+    if (captureBusy) {
+      console.log("[SubjectLift] capture starting, clearing any pending jump");
+      useSceneStore.getState().setExpectedJumpEventSeq(null, "");
     }
-  }, [voiceStatus]);
+  }, [captureBusy]);
 
   // ── Refs ──────────────────────────────────────────────────────────────
   const pressSessionIdRef = useRef(0);
@@ -586,10 +593,14 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   const pointerReleasedDuringStartRef = useRef(false);
   // Flag set when recorder truly starts, indicating a historical voice interaction is pending.
   // Consumed by generation success listener to set expectedJumpEventSeq.
-  // Reset on pointer release during starting, recorder start failure, or generation success.
-  // Stores the frozen relationshipId from the interaction that started this generation.
+  // Reset on pointer release during starting, recorder start failure, or
+  // generation success. Stores the frozen relationshipId from the
+  // interaction that started this generation AND the captureId that
+  // emitted the success event, so overlap between captures can't poison
+  // each other's pending state.
   const historicalVoicePendingRef = useRef<{
     relationshipId: string;
+    captureId: string;
   } | null>(null);
   // External recorder stop request (from "click anywhere while recording").
   // The hook receives the imperative recorder handle from the layer so the
@@ -610,6 +621,12 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   const onCaptureFinishedRef = useRef<
     ((reason: "user_stop" | "silence" | "no_speech" | "error" | "max") => void) | null
   >(null);
+  // Ref holding the recorder.start function. Set via registerRecorderBridge
+  // so that doStartRecording can call recorder.start(ctx) directly with a frozen
+  // VoiceProcessingContext, without going through the bridge callback.
+  const recorderStartRef = useRef<((ctx: VoiceProcessingContext) => Promise<boolean>) | null>(
+    null,
+  );
   // Tracks whether the lift ever reached "recording" so we can tell real
   // recorder stop events apart from startup-phase idle -> recording flips.
   // This ref is mirrored into a tick-based state at the bottom of the hook
@@ -635,7 +652,11 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   const canLiftChecks = {
     uiModeIsWallpaper: uiMode === "wallpaper",
     insertReady: initialInsertStatus === "ready",
-    voiceIdle: voiceStatus === "idle",
+    // Subject Lift must not run while a real microphone capture is live,
+    // but a background ASR / image-generation pipeline from a previous
+    // capture is allowed to keep running. The recorder hook exposes
+    // captureBusy as a reactive state for this exact purpose.
+    captureIdle: !captureBusy,
     hasGeneratedWallpaperUrl: !!activeWallpaperUrl,
     urlIsFinal:
       !!activeWallpaperUrl && activeWallpaperUrl.includes("/generated/"),
@@ -749,6 +770,26 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       return;
     }
 
+    // Defer auto-jump while the user is mid-Lift on a different
+    // revision. Showing a new wallpaper while a cutout from a historical
+    // revision is still lifted would visually overlay two revisions and
+    // break the pointer-capture experience.
+    const liftStatus = liftStateRef.current.status;
+    if (
+      liftStatus === "pressing" ||
+      liftStatus === "extracting" ||
+      liftStatus === "armed_lifted" ||
+      liftStatus === "starting" ||
+      liftStatus === "recording" ||
+      liftStatus === "releasing"
+    ) {
+      console.log(
+        "[SubjectLift] deferring auto-jump, lift state active",
+        { liftStatus, expectedJumpEventSeq },
+      );
+      return;
+    }
+
     const currentUrl = generatedWallpaperUrl;
     if (!currentUrl) return;
 
@@ -840,9 +881,9 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       });
       transitionState({ status: "starting", ...result });
 
-      // Await real recorder readiness. The bridge contract is Promise<boolean>.
-      const startHook = onStartRecordingRef.current;
-      if (!startHook) {
+      // Await real recorder readiness via the bridge-installed recorderStart.
+      const hook = recorderStartRef.current;
+      if (!hook) {
         console.warn(
           "[SubjectLift] startRecording aborted: no recorder bridge registered",
         );
@@ -851,13 +892,36 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
         return false;
       }
 
+      // Build frozen context once. The hook will set activeContextRef immediately.
+      const source = interactionSourceRef.current;
+      const relationshipId = useOnboardingStore.getState().userContext?.relationshipId ?? "";
+      const ctx: VoiceProcessingContext = {
+        captureId: crypto.randomUUID(),
+        relationshipId,
+        isFromHistoricalPage: source?.isFromHistoricalPage ?? false,
+        source: "subject_lift",
+      };
+
       let ok = false;
+      let okReason = "unknown";
       try {
-        ok = await startHook(viewerRole);
+        ok = await hook(ctx);
+        okReason = ok ? "ok" : "bridge_returned_false";
       } catch (err) {
         console.error("[SubjectLift] recorder bridge threw", err);
         ok = false;
+        okReason = err instanceof Error ? `throw:${err.message}` : "throw:unknown";
       }
+
+      console.log("[SubjectLift] auto-record start result", {
+        ok,
+        reason: okReason,
+        currentState: liftStateRef.current.status,
+        currentRevisionId: extractionResultRef.current
+          ? undefined
+          : undefined,
+        pointerReleasedDuringStart: pointerReleasedDuringStartRef.current,
+      });
 
       // If user released pointer during "starting", stop immediately.
       // We check the flag (set by pointerup) to handle the race condition.
@@ -877,13 +941,24 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
 
       if (!ok) {
         console.log(
-          "[SUBJECT_LIFT] recorder_start_failed returning to armed_lifted",
-          { viewerRole },
+          "[SubjectLift] auto-record start failed → releasing",
+          { viewerRole, reason: okReason },
         );
         // Clear historical voice pending flag since no generation will happen.
         historicalVoicePendingRef.current = null;
-        // Roll back to armed_lifted — do NOT animate the cutout away.
-        transitionState({ status: "armed_lifted", ...result });
+        // DO NOT stay in armed_lifted — that creates a permanent stuck state
+        // across revisions because the auto-record timer has already fired
+        // and no fresh timer exists. Transition through releasing so the
+        // next pointerdown starts from a clean slate.
+        if (extractionResultRef.current) {
+          enterReleasing(
+            extractionResultRef.current.cutoutUrl,
+            extractionResultRef.current.bbox,
+            extractionResultRef.current.region,
+          );
+        } else {
+          transitionState({ status: "idle" });
+        }
         return false;
       }
 
@@ -895,10 +970,12 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       currentRecordingSeqRef.current = ++startRecordingSeqRef.current;
       // Set historical voice pending flag if this is from a historical page.
       // This flag will be consumed when generation succeeds or fails.
-      // Store the frozen relationshipId from the interaction source.
+      // Store the frozen relationshipId + the recorder-side captureId so
+      // overlap captures cannot poison each other's pending context.
       if (interactionSourceRef.current?.isFromHistoricalPage === true) {
         historicalVoicePendingRef.current = {
           relationshipId: interactionSourceRef.current.relationshipId ?? "",
+          captureId: getCurrentCaptureId() ?? "",
         };
       } else {
         historicalVoicePendingRef.current = null;
@@ -924,8 +1001,19 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
   // Calls startRecording with current viewerRole. Used by auto-record timer.
   const doStartRecording = useCallback(async () => {
     if (liftStateRef.current.status !== "armed_lifted") return;
-    await startRecording(viewerRole);
-  }, [viewerRole, startRecording]);
+    const source = interactionSourceRef.current;
+    const relationshipId = useOnboardingStore.getState().userContext?.relationshipId ?? "";
+    const ctx: VoiceProcessingContext = {
+      captureId: crypto.randomUUID(),
+      relationshipId,
+      isFromHistoricalPage: source?.isFromHistoricalPage ?? false,
+      source: "subject_lift",
+    };
+    const hook = recorderStartRef.current;
+    if (hook) {
+      await hook(ctx);
+    }
+  }, []);
 
   // ── Enter armed_lifted and start auto-record timer ────────────────────
   // After extraction completes, immediately enter armed_lifted and start
@@ -1333,6 +1421,9 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
       cancelPress();
       extractionResultRef.current = null;
       setHasEnteredRecording(false);
+      // Always reset the pointer-during-start race flag so that a previous
+      // session's stale "true" cannot silently abort the next startRecording.
+      pointerReleasedDuringStartRef.current = false;
       const sessionId = ++pressSessionIdRef.current;
 
       // Freeze the interaction source at pointerdown time
@@ -1678,12 +1769,12 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     [clearArmedTimeout],
   );
 
-  // Allow the layer to install the actual recorder start/stop hooks
-  // without re-creating our callbacks. The recorder owns the long-lived
-  // MediaRecorder instance.
+  // Allow the layer to install the actual recorder start/stop hooks and capture-finished
+  // callback. recorderStartRef gives doStartRecording a direct handle to call
+  // recorder.start(ctx) with a frozen immutable context.
   const registerRecorderBridge = useCallback(
     (
-      startHook: ((viewerRole: ViewerRole) => Promise<boolean>) | null,
+      recorderStart: ((ctx: VoiceProcessingContext) => Promise<boolean>) | null,
       stopHook: (() => void) | null,
       captureFinishedHook:
         | ((
@@ -1691,7 +1782,7 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
           ) => void)
         | null = null,
     ) => {
-      onStartRecordingRef.current = startHook;
+      recorderStartRef.current = recorderStart;
       onStopRecordingRef.current = stopHook;
       onCaptureFinishedRef.current = captureFinishedHook;
     },
@@ -1717,7 +1808,6 @@ export function useSubjectLift(opts: UseSubjectLiftOptions) {
     canLift,
     canLiftChecks,
     viewerRole,
-    startRecording,
     stopRecording,
     registerRecorderBridge,
     notifyCaptureFinished,

@@ -271,27 +271,44 @@ export function WallpaperStage() {
       {!showAssets &&
       uiMode === "wallpaper" &&
       availableWallpapers.length >= 2 ? (
-        <div
-          className="pointer-events-none absolute left-0 right-0 z-40 flex justify-center"
-          style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 5rem)" }}
-          aria-hidden
-        >
-          <div className="flex items-center gap-2 rounded-full bg-black/25 py-1.5 px-3 shadow-sm backdrop-blur-sm">
-            {availableWallpapers.map((_, i) => {
-              const isActive = i === currentPageIndex;
-              return (
-                <div
-                  key={i}
-                  className={`rounded-full transition-all duration-200 ${
-                    isActive
-                      ? "h-2 w-5 bg-white/90"
-                      : "h-2 w-2 bg-white/50"
-                  }`}
-                />
-              );
-            })}
-          </div>
-        </div>
+        (() => {
+          const total = availableWallpapers.length;
+          // availableWallpapers is latest → oldest (newest first);
+          // visualIndex flips so oldest sits at the left, newest at the right.
+          const visualIndex = total - 1 - currentPageIndex;
+          const WINDOW_SIZE = 5;
+          let windowStart: number;
+          if (total <= WINDOW_SIZE) {
+            windowStart = 0;
+          } else {
+            windowStart = Math.max(0, Math.min(visualIndex - 2, total - WINDOW_SIZE));
+          }
+          const windowEnd = Math.min(total, windowStart + WINDOW_SIZE);
+          return (
+            <div
+              className="pointer-events-none absolute left-0 right-0 z-40 flex justify-center"
+              style={{ bottom: "calc(env(safe-area-inset-bottom, 0px) + 5rem)" }}
+              aria-hidden
+            >
+              <div className="flex items-center gap-2 rounded-full bg-black/25 py-1.5 px-3 shadow-sm backdrop-blur-sm">
+                {Array.from({ length: windowEnd - windowStart }, (_, offset) => {
+                  const i = windowStart + offset;
+                  const isActive = i === visualIndex;
+                  return (
+                    <div
+                      key={i}
+                      className={`h-2 w-2 rounded-full transition-all duration-200 ${
+                        isActive
+                          ? "bg-white/95 scale-110"
+                          : "bg-white/40"
+                      }`}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()
       ) : null}
 
       {!showAssets && uiMode === "wallpaper" ? (

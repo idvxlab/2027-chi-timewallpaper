@@ -26,6 +26,7 @@ import {
   useAppPreferencesStore,
   type AppLanguage,
 } from "@/lib/hooks/useAppPreferencesStore";
+import { useOnboardingStore } from "@/lib/hooks/useOnboardingStore";
 import { dictionaries } from "@/lib/i18n";
 
 export type WallpaperVoiceEditStatus =
@@ -37,6 +38,20 @@ export type WallpaperVoiceEditStatus =
 export type ViewerRole = "child" | "elder";
 export type VoiceAsrMode = "flash" | "stream";
 export type RecorderSource = "central_button" | "subject_lift";
+
+/**
+ * Immutable context for one voice capture → processing pipeline. Created once
+ * at capture start and threaded through every async stage so that:
+ *   - A and B running concurrently cannot poison each other's job tracking
+ *   - Generation success events carry the exact captureId that produced them
+ *   - No mutable global state is read inside async pipelines
+ */
+export type VoiceProcessingContext = Readonly<{
+  captureId: string;
+  relationshipId: string;
+  isFromHistoricalPage: boolean;
+  source: RecorderSource;
+}>;
 
 const STREAM_SAMPLE_RATE = 16_000;
 const STREAM_CHUNK_MS = 200;
@@ -118,6 +133,11 @@ export function useWallpaperVoiceEditRecorder() {
   const setStatus = useVoiceRuntimeStore((state) => state.setStatus);
   const setRuntimeMode = useVoiceRuntimeStore((state) => state.setMode);
   const [elapsedSec, setElapsedSec] = useState(0);
+  // Reactive mirrors of the lifecycle refs so React effects (Subject Lift
+  // canLift gate) can re-render when they change. The hook still owns the
+  // authoritative truth in captureBusyRef / processingJobsRef.
+  const [captureBusyState, setCaptureBusyState] = useState(false);
+  const [processingJobCountState, setProcessingJobCountState] = useState(0);
 
   const setGeneratedWallpaperUrl = useSceneStore(
     (state) => state.setGeneratedWallpaperUrl,
@@ -162,9 +182,65 @@ export function useWallpaperVoiceEditRecorder() {
   // take 500ms–2s.
   const actualRecorderReadyAtRef = useRef(0);
   const viewerRoleRef = useRef<ViewerRole>("child");
-  const isBusyRef = useRef(false);
+  // Microphone-capture busy flag. Set the instant a real recorder pipeline
+  // (MediaRecorder / WebSocket) starts; cleared the moment the recorder
+  // fully releases its hardware/socket resources, regardless of whether
+  // the ASR / HTTP / image-generation pipeline is still running.
+  const captureBusyRef = useRef(false);
+  // Generation pipeline jobs. Each capture allocates a stable jobId that
+  // survives across the microphone-capture window and is removed only by
+  // that pipeline's own finally block. Multiple jobs may coexist when
+  // the user starts a new capture while the previous generation is still
+  // running.
+  const processingJobsRef = useRef<Set<string>>(new Set());
+  // Per-capture jobId allocator. Set the moment a real capture begins so
+  // the ASR / HTTP / image-generation pipeline can register itself and
+  // remove itself on completion.
+  const processingJobIdRef = useRef<string>("");
   const requestIdRef = useRef("");
   const activeSourceRef = useRef<RecorderSource>("subject_lift");
+  // Stable immutable context for the current capture. Written once at
+  // capture start (when microphone permission is granted), read by every
+  // async pipeline stage thereafter. No mutable global state is read inside
+  // async callbacks — only this frozen snapshot.
+  const activeContextRef = useRef<VoiceProcessingContext | null>(null);
+  // Public getter so external consumers (e.g. Subject Lift) can read
+  // the current captureId without bypassing the recorder hook's
+  // lifecycle.
+  const getCurrentCaptureId = useCallback(
+    (): string => processingJobIdRef.current,
+    [],
+  );
+
+  // Synchronize the lifecycle refs into React state. Centralized so every
+  // path that mutates captureBusyRef or processingJobsRef only has to
+  // call one function — and so the existing mutation sites stay close
+  // to the surrounding logic.
+  //
+  // The setters are stored in refs because the lifecycle sync is invoked
+  // from inside useCallback bodies whose closures capture an older
+  // setCaptureBusyState / setProcessingJobCountState identity otherwise.
+  const setCaptureBusyStateRef = useRef(setCaptureBusyState);
+  setCaptureBusyStateRef.current = setCaptureBusyState;
+  const setProcessingJobCountStateRef = useRef(setProcessingJobCountState);
+  setProcessingJobCountStateRef.current = setProcessingJobCountState;
+  const syncLifecycleState = () => {
+    setCaptureBusyStateRef.current(captureBusyRef.current);
+    setProcessingJobCountStateRef.current(processingJobsRef.current.size);
+  };
+
+  // Safe status transition. When the current capture's pipeline finishes,
+  // we only set status to "idle" if there are no other processing jobs running.
+  // This prevents A's finally from overwriting B's "editing"/"transcribing" status
+  // when captures overlap.
+  const safeSetIdleIfNoOtherJobs = (currentJobId: string) => {
+    const otherJobs = Array.from(processingJobsRef.current).filter(
+      (id) => id !== currentJobId,
+    );
+    if (otherJobs.length === 0 && !captureBusyRef.current) {
+      setStatus("idle");
+    }
+  };
 
   // External listeners (e.g. Subject Lift) that want to know the exact
   // moment real audio capture stops. We fire on user stop, silence auto
@@ -176,23 +252,43 @@ export function useWallpaperVoiceEditRecorder() {
     Set<(reason: "user_stop" | "silence" | "no_speech" | "error" | "max") => void>
   >(new Set());
 
-  // Listeners for generation success: called with the eventSeq when a voice
-  // interaction successfully generates a new wallpaper revision. Subject Lift
-  // uses this to set expectedJumpEventSeq for historical page auto-jump.
-  const generationSuccessListenersRef = useRef<Set<(eventSeq: number) => void>>(new Set());
+  // Listeners for generation success: called with the captureId / eventSeq
+  // when a voice interaction successfully generates a new wallpaper
+  // revision. Subject Lift uses this to set expectedJumpEventSeq for
+  // historical page auto-jump. The captureId lets listeners ignore events
+  // from a different (older / newer) request when processing pipelines
+  // overlap.
+  const generationSuccessListenersRef = useRef<
+    Set<
+      (payload: {
+        eventSeq: number;
+        captureId: string;
+        relationshipId: string;
+        isFromHistoricalPage: boolean;
+      }) => void
+    >
+  >(new Set());
 
-  const emitGenerationSuccess = useCallback((eventSeq: number) => {
-    const listeners = generationSuccessListenersRef.current;
-    if (!listeners.size) return;
-    const snapshot = Array.from(listeners);
-    for (const listener of snapshot) {
-      try {
-        listener(eventSeq);
-      } catch (err) {
-        console.error("[VOICE] generationSuccess listener threw", err);
+  const emitGenerationSuccess = useCallback(
+    (payload: {
+      eventSeq: number;
+      captureId: string;
+      relationshipId: string;
+      isFromHistoricalPage: boolean;
+    }) => {
+      const listeners = generationSuccessListenersRef.current;
+      if (!listeners.size) return;
+      const snapshot = Array.from(listeners);
+      for (const listener of snapshot) {
+        try {
+          listener(payload);
+        } catch (err) {
+          console.error("[VOICE] generationSuccess listener threw", err);
+        }
       }
-    }
-  }, []);
+    },
+    [],
+  );
 
   const emitCaptureFinished = useCallback(
     (reason: "user_stop" | "silence" | "no_speech" | "error" | "max") => {
@@ -226,7 +322,11 @@ export function useWallpaperVoiceEditRecorder() {
   }, []);
 
   const applyAgentResult = useCallback(
-    (response: FirstVoiceAgentRunResult, _durationMs: number): boolean => {
+    (
+      response: FirstVoiceAgentRunResult,
+      _durationMs: number,
+      ctx: VoiceProcessingContext,
+    ): boolean => {
       const result = response.result;
       const views = result.wallpaperViews;
       const viewerRole = viewerRoleRef.current;
@@ -256,9 +356,16 @@ export function useWallpaperVoiceEditRecorder() {
       }
       if (!wallpaperUrl) throw new Error(`Missing ${viewerRole} wallpaper view`);
       setGeneratedWallpaperUrl(wallpaperUrl);
-      // Emit generation success with eventSeq for Subject Lift auto-jump correlation.
+      // Emit generation success with full immutable context for request-scoped
+      // attribution. Uses the ctx parameter (frozen at processFlashRecording entry)
+      // rather than activeContextRef to avoid race conditions with concurrent captures.
       if (eventSeq > 0) {
-        emitGenerationSuccess(eventSeq);
+        emitGenerationSuccess({
+          eventSeq,
+          captureId: ctx.captureId,
+          relationshipId: ctx.relationshipId,
+          isFromHistoricalPage: ctx.isFromHistoricalPage,
+        });
       }
       return true;
     },
@@ -267,14 +374,28 @@ export function useWallpaperVoiceEditRecorder() {
 
   const processFlashRecording = useCallback(
     async (blob: Blob, durationMs: number) => {
-      const profile = VOICE_PROFILES[viewerRoleRef.current];
-      if (durationMs < profile.minSpeechMs || blob.size < MIN_BLOB_BYTES) {
-        console.warn("[WallpaperVoiceEdit] recording too short, please retry");
-        isBusyRef.current = false;
+      // Freeze context at processing-start so concurrent captures cannot overwrite
+      // it before applyAgentResult reads it asynchronously.
+      const ctx = activeContextRef.current;
+      if (!ctx) {
+        console.error("[WallpaperVoiceEdit] processFlashRecording: no active context");
+        captureBusyRef.current = false;
+        processingJobsRef.current.delete(processingJobIdRef.current);
+        syncLifecycleState();
         setStatus("idle");
         return;
       }
-      isBusyRef.current = true;
+      const profile = VOICE_PROFILES[viewerRoleRef.current];
+      if (durationMs < profile.minSpeechMs || blob.size < MIN_BLOB_BYTES) {
+        console.warn("[WallpaperVoiceEdit] recording too short, please retry");
+        captureBusyRef.current = false;
+        processingJobsRef.current.delete(processingJobIdRef.current);
+        syncLifecycleState();
+        setStatus("idle");
+        return;
+      }
+      processingJobsRef.current.add(processingJobIdRef.current);
+      syncLifecycleState();
       setStatus("editing");
       let queued = false;
       try {
@@ -282,7 +403,7 @@ export function useWallpaperVoiceEditRecorder() {
         if (source === "central_button") {
           setInitialInsertStatus("generating");
           const response = await generateFirstVoiceWallpapers(blob);
-          const completed = applyAgentResult(response, durationMs);
+          const completed = applyAgentResult(response, durationMs, ctx);
           if (!completed) {
             queued = true;
           } else {
@@ -303,7 +424,7 @@ export function useWallpaperVoiceEditRecorder() {
             blob,
             requestIdRef.current || crypto.randomUUID(),
           );
-          queued = !applyAgentResult(response, durationMs);
+          queued = !applyAgentResult(response, durationMs, ctx);
         }
       } catch (error) {
         console.error(
@@ -314,8 +435,9 @@ export function useWallpaperVoiceEditRecorder() {
           setInitialInsertStatus("failed");
         }
       } finally {
-        isBusyRef.current = false;
-        if (!queued) setStatus("idle");
+        processingJobsRef.current.delete(processingJobIdRef.current);
+        syncLifecycleState();
+        if (!queued) safeSetIdleIfNoOtherJobs(processingJobIdRef.current);
       }
     },
     [applyAgentResult, setInitialInsertStatus, setStatus],
@@ -394,7 +516,9 @@ export function useWallpaperVoiceEditRecorder() {
         if (socket?.readyState === WebSocket.OPEN)
           socket.send(JSON.stringify({ type: "cancel" }));
         closeStreamSocket();
-        isBusyRef.current = false;
+        captureBusyRef.current = false;
+        processingJobsRef.current.delete(processingJobIdRef.current);
+        syncLifecycleState();
         setStatus("idle");
         return;
       }
@@ -478,7 +602,9 @@ export function useWallpaperVoiceEditRecorder() {
         stream.getTracks().forEach((track) => track.stop());
         mediaRecorderRef.current = null;
         flashChunksRef.current = [];
-        isBusyRef.current = false;
+        captureBusyRef.current = false;
+        processingJobsRef.current.delete(processingJobIdRef.current);
+        syncLifecycleState();
         setStatus("idle");
       };
       recorder.start(STREAM_CHUNK_MS);
@@ -488,6 +614,18 @@ export function useWallpaperVoiceEditRecorder() {
 
   const startStreamingRecording = useCallback(
     async (stream: MediaStream) => {
+      // Freeze context at streaming-start so concurrent captures cannot overwrite
+      // it before the async message handler reads it.
+      const ctx = activeContextRef.current;
+      if (!ctx) {
+        console.error("[WallpaperVoiceEdit] startStreamingRecording: no active context");
+        closeStreamSocket();
+        captureBusyRef.current = false;
+        processingJobsRef.current.delete(processingJobIdRef.current);
+        syncLifecycleState();
+        setStatus("idle");
+        return;
+      }
       const profile = VOICE_PROFILES[viewerRoleRef.current];
       const socket = new WebSocket(currentWallpaperVoiceStreamUrl());
       streamSocketRef.current = socket;
@@ -528,11 +666,12 @@ export function useWallpaperVoiceEditRecorder() {
             const durationMs = Date.now() - startedAtRef.current;
             let queued = false;
             try {
-              queued = !applyAgentResult(message.payload, durationMs);
+              queued = !applyAgentResult(message.payload, durationMs, ctx);
             } finally {
-              isBusyRef.current = false;
+              processingJobsRef.current.delete(processingJobIdRef.current);
+              syncLifecycleState();
               closeStreamSocket();
-              if (!queued) setStatus("idle");
+              if (!queued) safeSetIdleIfNoOtherJobs(processingJobIdRef.current);
             }
           } else if (message.type === "error") {
             window.clearTimeout(timeout);
@@ -550,7 +689,9 @@ export function useWallpaperVoiceEditRecorder() {
               closeStreamSocket();
             } else {
               console.error(`[WallpaperVoiceEdit] ${detail}`);
-              isBusyRef.current = false;
+              captureBusyRef.current = false;
+              processingJobsRef.current.delete(processingJobIdRef.current);
+              syncLifecycleState();
               clearTimers();
               cleanupStreamingAudio();
               closeStreamSocket();
@@ -692,21 +833,39 @@ export function useWallpaperVoiceEditRecorder() {
   );
 
   const startRecording = useCallback(
-    async (source: RecorderSource): Promise<boolean> => {
-      console.log("[VOICE] start_requested", { source });
-      if (isBusyRef.current || mediaRecorderRef.current || streamSocketRef.current) {
-        console.log("[VOICE] start_rejected: already busy or running");
+    async (ctx: VoiceProcessingContext): Promise<boolean> => {
+      console.log("[VOICE] start_requested", { ctx });
+      // Freeze the immutable context immediately. All async pipeline stages read
+      // from activeContextRef — never from mutable global state.
+      activeContextRef.current = ctx;
+      // Only the real microphone-capture ref is a hard gate. Background
+      // generation pipelines (ASR / HTTP / image-edit) do NOT block a
+      // brand-new capture — they are tracked via processingJobsRef.
+      if (captureBusyRef.current) {
+        console.log("[VOICE] start_rejected: capture_busy");
+        activeContextRef.current = null;
+        return false;
+      }
+      if (mediaRecorderRef.current) {
+        console.log("[VOICE] start_rejected: media_recorder_exists");
+        activeContextRef.current = null;
+        return false;
+      }
+      if (streamSocketRef.current) {
+        console.log("[VOICE] start_rejected: stream_socket_exists");
+        activeContextRef.current = null;
         return false;
       }
       const scene = useSceneStore.getState();
       // Subject Lift: allow recording on ANY wallpaper revision.
       // The cutout comes from the currently visible wallpaper;
       // the backend uses latest shared wallpaper for generation.
-      if (source === "subject_lift") {
+      if (ctx.source === "subject_lift") {
         if (!scene.generatedWallpaperUrl) {
           console.warn(
-            "[VOICE] start_rejected: no wallpaper available for subject lift",
+            "[VOICE] start_rejected: no_generated_wallpaper",
           );
+          activeContextRef.current = null;
           return false;
         }
         // Central button: require initial_voice/processing mode
@@ -717,24 +876,27 @@ export function useWallpaperVoiceEditRecorder() {
           interactionMode !== "processing"
         ) {
           console.warn(
-            `[VOICE] start_rejected: ${source} mode=${interactionMode}`,
+            `[VOICE] start_rejected: ${ctx.source} mode=${interactionMode}`,
           );
+          activeContextRef.current = null;
           return false;
         }
       }
 
       try {
         const current = await getCurrentWallpaper();
-        if (source === "central_button" && current.stage === "wallpaper_active") {
+        if (ctx.source === "central_button" && current.stage === "wallpaper_active") {
           console.warn(
             "[VOICE] start_rejected: central button not allowed after first voice is done",
           );
+          activeContextRef.current = null;
           return false;
         }
-        if (source === "subject_lift" && current.stage !== "wallpaper_active") {
+        if (ctx.source === "subject_lift" && current.stage !== "wallpaper_active") {
           console.warn(
             "[VOICE] start_rejected: subject lift not allowed before first voice",
           );
+          activeContextRef.current = null;
           return false;
         }
       } catch (error) {
@@ -742,19 +904,22 @@ export function useWallpaperVoiceEditRecorder() {
           "[VOICE] cannot reach backend stage, recording aborted",
           error,
         );
+        activeContextRef.current = null;
         return false;
       }
       if (!navigator.mediaDevices?.getUserMedia) {
         console.error("[VOICE] browser does not support recording");
+        activeContextRef.current = null;
         return false;
       }
-      activeSourceRef.current = source;
+      activeSourceRef.current = ctx.source;
       const requestedMode =
-        source === "central_button"
+        ctx.source === "central_button"
           ? "flash"
           : useVoiceRuntimeStore.getState().mode;
       if (requestedMode === "flash" && !window.MediaRecorder) {
         console.error("[VOICE] browser does not support MediaRecorder");
+        activeContextRef.current = null;
         return false;
       }
 
@@ -771,6 +936,7 @@ export function useWallpaperVoiceEditRecorder() {
         console.log("[VOICE] microphone_ready");
       } catch (error) {
         console.error("[VOICE] microphone permission denied", error);
+        activeContextRef.current = null;
         return false;
       }
 
@@ -791,7 +957,11 @@ export function useWallpaperVoiceEditRecorder() {
       streamFinishedRef.current = false;
       streamAsrFinalRef.current = false;
       endingRef.current = false;
-      isBusyRef.current = true;
+      // Allocate a stable jobId so the downstream generation pipeline can
+      // register itself in processingJobsRef and only remove its own entry.
+      processingJobIdRef.current = ctx.captureId;
+      captureBusyRef.current = true;
+      syncLifecycleState();
       setElapsedSec(0);
 
       let activeMode = requestedMode;
@@ -813,7 +983,9 @@ export function useWallpaperVoiceEditRecorder() {
         } else {
           console.error("[VOICE] pipeline start failed", error);
           stream.getTracks().forEach((track) => track.stop());
-          isBusyRef.current = false;
+          captureBusyRef.current = false;
+          processingJobsRef.current.delete(processingJobIdRef.current);
+          syncLifecycleState();
           if (!streamFinishedRef.current) {
             fallbackStreamToFlash(
               error instanceof Error ? error.message : String(error),
@@ -868,7 +1040,14 @@ export function useWallpaperVoiceEditRecorder() {
     async (viewerRole?: ViewerRole) => {
       if (viewerRole) viewerRoleRef.current = viewerRole;
       if (status === "idle") {
-        const ok = await startRecording("central_button");
+        const ctx: VoiceProcessingContext = {
+          captureId: crypto.randomUUID(),
+          relationshipId:
+            useOnboardingStore.getState().userContext?.relationshipId ?? "",
+          isFromHistoricalPage: false,
+          source: "central_button",
+        };
+        const ok = await startRecording(ctx);
         console.log("[VOICE] toggle result", { ok });
       } else if (status === "recording") {
         console.log("[VOICE] stop_requested reason=toggle");
@@ -879,16 +1058,10 @@ export function useWallpaperVoiceEditRecorder() {
   );
 
   const start = useCallback(
-    (
-      viewerRole: ViewerRole,
-      source: RecorderSource = "subject_lift",
-    ): Promise<boolean> => {
-      viewerRoleRef.current = viewerRole;
-      if (status === "idle") return startRecording(source);
-      // Not idle: already running or busy — caller should not transition.
-      return Promise.resolve(false);
+    async (ctx: VoiceProcessingContext): Promise<boolean> => {
+      return startRecording(ctx);
     },
-    [startRecording, status],
+    [startRecording],
   );
 
   const setMode = useCallback(
@@ -936,7 +1109,14 @@ export function useWallpaperVoiceEditRecorder() {
   );
 
   const subscribeGenerationSuccess = useCallback(
-    (listener: (eventSeq: number) => void): (() => void) => {
+    (
+      listener: (payload: {
+        eventSeq: number;
+        captureId: string;
+        relationshipId: string;
+        isFromHistoricalPage: boolean;
+      }) => void,
+    ): (() => void) => {
       generationSuccessListenersRef.current.add(listener);
       return () => {
         generationSuccessListenersRef.current.delete(listener);
@@ -955,6 +1135,19 @@ export function useWallpaperVoiceEditRecorder() {
     finishRecording,
     subscribeCaptureFinished,
     subscribeGenerationSuccess,
+    // Capture-only busy signal. Backed by a real React state so it can
+    // re-trigger effects that gate Subject Lift. Decoupled from the
+    // generation pipeline (which lives in processingJobsRef).
+    captureBusy: captureBusyState,
+    // Public counter of background generation jobs. Allows the UI to
+    // render a "processing N" indicator without colliding with the
+    // microphone-capture lifecycle.
+    processingJobCount: processingJobCountState,
+    // Stable jobId of the active capture (or "" while idle). Subject
+    // Lift stores this alongside its historical-pending context so an
+    // async generation result cannot be credited against the wrong
+    // captureId.
+    getCurrentCaptureId,
   };
 }
 

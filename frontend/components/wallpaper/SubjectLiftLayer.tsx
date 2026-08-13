@@ -47,7 +47,10 @@ import {
   type LiftState,
 } from "@/lib/hooks/useSubjectLift";
 import { useOnboardingStore } from "@/lib/hooks/useOnboardingStore";
-import { useWallpaperVoiceEditRecorder } from "@/lib/hooks/useWallpaperVoiceEditRecorder";
+import {
+  useWallpaperVoiceEditRecorder,
+  type VoiceProcessingContext,
+} from "@/lib/hooks/useWallpaperVoiceEditRecorder";
 import { getWallpaperDisplayGeometry } from "@/lib/wallpaperDisplayGeometry";
 
 type NaturalSize = { width: number; height: number };
@@ -101,7 +104,6 @@ export function SubjectLiftLayer({
     canLift,
     canLiftChecks,
     viewerRole,
-    startRecording,
     stopRecording,
     registerRecorderBridge,
     notifyCaptureFinished,
@@ -126,17 +128,15 @@ export function SubjectLiftLayer({
     start: recorderStart,
     finishRecording: recorderStop,
     subscribeCaptureFinished,
+    captureBusy,
   } = useWallpaperVoiceEditRecorder();
 
   // Wire recorder hooks into the subject-lift hook so it can fire them.
-  // The bridge contract is Promise<boolean>: true only after the underlying
-  // recorder pipeline (microphone + WebSocket + AudioContext) is verified
-  // ready. We MUST await the real result before signalling "recording" — a
-  // fire-and-forget here would cause SubjectLift to flash recording and
-  // immediately fall back to idle before the real recorder becomes live.
+  // recorderStart is passed to the bridge so doStartRecording can call it with
+  // a frozen VoiceProcessingContext. stop and capture-finished are also wired.
   useEffect(() => {
     registerRecorderBridge(
-      (vr) => recorderStart(vr),
+      recorderStart,
       () => {
         console.log("[VOICE] stop_requested reason=subject_layer_bridge");
         recorderStop();
@@ -372,14 +372,24 @@ export function SubjectLiftLayer({
         "[wallpaper_recording_interaction]",
         {
           action: "start",
-          trigger: "subject",
+          trigger: "subject_tap",
           voiceStatus,
           pointerId: "click",
         },
       );
-      startRecording(currentViewerRole);
+      // Start recording directly with a frozen context. This mirrors what
+      // doStartRecording does for the auto-record path.
+      const relationshipId =
+        useOnboardingStore.getState().userContext?.relationshipId ?? "";
+      const ctx: VoiceProcessingContext = {
+        captureId: crypto.randomUUID(),
+        relationshipId,
+        isFromHistoricalPage: false,
+        source: "subject_lift",
+      };
+      recorderStart(ctx);
     },
-    [state.status, startRecording, currentViewerRole, voiceStatus],
+    [state.status, recorderStart, currentViewerRole, voiceStatus],
   );
 
   // ── Recording state transitions ────────────────────────────────────
@@ -837,7 +847,7 @@ function DebugRegions({
   canLiftChecks: {
     uiModeIsWallpaper: boolean;
     insertReady: boolean;
-    voiceIdle: boolean;
+    captureIdle: boolean;
     hasGeneratedWallpaperUrl: boolean;
     urlIsFinal: boolean;
     focusBalanced: boolean;
@@ -903,7 +913,7 @@ function DebugRegions({
 canLift=${canLift}
 uiMode? ${canLiftChecks.uiModeIsWallpaper}
 insertReady? ${canLiftChecks.insertReady}
-voiceIdle? ${canLiftChecks.voiceIdle}
+captureIdle? ${canLiftChecks.captureIdle}
 hasUrl? ${canLiftChecks.hasGeneratedWallpaperUrl}
 urlIsFinal? ${canLiftChecks.urlIsFinal}
 focusBalanced? ${canLiftChecks.focusBalanced}
