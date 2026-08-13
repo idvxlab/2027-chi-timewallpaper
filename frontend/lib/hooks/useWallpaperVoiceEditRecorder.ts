@@ -112,6 +112,20 @@ const VOICE_PROFILES: Record<ViewerRole, VoiceProfile> = {
   },
 };
 
+// ── Module-level generation success broadcaster ─────────────────────────────
+// Multiple hook instances may exist (one per component). Generation success
+// is emitted by whichever instance is actively running capture, but
+// listeners (e.g. WallpaperStage's auto-jump subscriber) can be hosted
+// on a different, lighter instance. Storage must therefore be SHARED at
+// module level so the emit on instance A reaches listeners on instance B.
+export type GenerationSuccessPayload = {
+  eventSeq: number;
+  captureId: string;
+  relationshipId: string;
+  isFromHistoricalPage: boolean;
+};
+const generationSuccessListeners = new Set<(payload: GenerationSuccessPayload) => void>();
+
 type VoiceRuntimeState = {
   status: WallpaperVoiceEditStatus;
   mode: VoiceAsrMode;
@@ -128,6 +142,22 @@ const useVoiceRuntimeStore = create<VoiceRuntimeState>((set) => ({
 
 export function setWallpaperVoiceEditStatus(status: WallpaperVoiceEditStatus) {
   useVoiceRuntimeStore.getState().setStatus(status);
+}
+
+/**
+ * Standalone subscription surface for generation success events.
+ * Use this from components that only need to react to generation success
+ * (e.g. WallpaperStage's auto-jump-to-latest) WITHOUT instantiating a
+ * full recorder lifecycle. The listener storage is module-level shared,
+ * so the emit from any recorder instance reaches this listener.
+ */
+export function subscribeGenerationSuccessGlobal(
+  listener: (payload: GenerationSuccessPayload) => void,
+): () => void {
+  generationSuccessListeners.add(listener);
+  return () => {
+    generationSuccessListeners.delete(listener);
+  };
 }
 
 export function useWallpaperVoiceEditRecorder() {
@@ -267,27 +297,16 @@ export function useWallpaperVoiceEditRecorder() {
   // historical page auto-jump. The captureId lets listeners ignore events
   // from a different (older / newer) request when processing pipelines
   // overlap.
-  const generationSuccessListenersRef = useRef<
-    Set<
-      (payload: {
-        eventSeq: number;
-        captureId: string;
-        relationshipId: string;
-        isFromHistoricalPage: boolean;
-      }) => void
-    >
-  >(new Set());
+  // NOTE: listener storage is module-level (see generationSuccessListeners
+  // above) so any hook instance can emit and any other instance can
+  // subscribe. This is essential for WallpaperStage — its recorder
+  // instance is empty (only used for subscription surface) while the real
+  // emit comes from the hook instance created by useHoldAnywhereRecorder.
 
   const emitGenerationSuccess = useCallback(
-    (payload: {
-      eventSeq: number;
-      captureId: string;
-      relationshipId: string;
-      isFromHistoricalPage: boolean;
-    }) => {
-      const listeners = generationSuccessListenersRef.current;
-      if (!listeners.size) return;
-      const snapshot = Array.from(listeners);
+    (payload: GenerationSuccessPayload) => {
+      if (!generationSuccessListeners.size) return;
+      const snapshot = Array.from(generationSuccessListeners);
       for (const listener of snapshot) {
         try {
           listener(payload);
@@ -1334,17 +1353,10 @@ export function useWallpaperVoiceEditRecorder() {
   );
 
   const subscribeGenerationSuccess = useCallback(
-    (
-      listener: (payload: {
-        eventSeq: number;
-        captureId: string;
-        relationshipId: string;
-        isFromHistoricalPage: boolean;
-      }) => void,
-    ): (() => void) => {
-      generationSuccessListenersRef.current.add(listener);
+    (listener: (payload: GenerationSuccessPayload) => void): (() => void) => {
+      generationSuccessListeners.add(listener);
       return () => {
-        generationSuccessListenersRef.current.delete(listener);
+        generationSuccessListeners.delete(listener);
       };
     },
     [],

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getMemoryObjects, type MemoryObjectItem } from "@/lib/api";
+import { getMemoryObjects, type MemoryObjectItem, STATIC_BASE_SCENE_PATH, resolveApiAssetUrl } from "@/lib/api";
 import { useOnboardingStore } from "@/lib/hooks/useOnboardingStore";
 import {
   getSelectedWallpaper,
@@ -10,6 +10,7 @@ import {
   TODAY_INDEX,
 } from "@/lib/hooks/useSceneStore";
 import { useWallpaperSync } from "@/lib/hooks/useWallpaperSync";
+import { subscribeGenerationSuccessGlobal } from "@/lib/hooks/useWallpaperVoiceEditRecorder";
 import { useHoldAnywhereRecorder } from "@/lib/hooks/useHoldAnywhereRecorder";
 import { AtmosphereOverlay } from "./AtmosphereOverlay";
 import {
@@ -35,7 +36,25 @@ export function WallpaperStage() {
   const focusMode = useSceneStore((s) => s.focusMode);
   const selectedWallpaper = useSceneStore(getSelectedWallpaper);
   const wallpapersByDay = useSceneStore((s) => s.wallpapersByDay);
+  const wallpaperStateHydrated = useSceneStore((s) => s.wallpaperStateHydrated);
   const toggleUiMode = useSceneStore((s) => s.toggleUiMode);
+
+  // ── Derived gating flags ────────────────────────────────────────────────
+  // True when a generated shared wallpaper exists and hold-anywhere is allowed.
+  // Hold-anywhere is the primary voice interaction for wallpaper canvas.
+  // It is active whenever wallpaper mode is on, a real wallpaper revision exists,
+  // and hydration is complete. We intentionally do NOT gate on interactionMode
+  // (which returns "history_disabled" for historical revisions) so that
+  // hold-anywhere works on both latest AND historical revisions — the backend
+  // always generates from the latest regardless of where the user is swiped.
+  const hasAnyWallpaperRevision =
+    wallpapersByDay &&
+    Object.values(wallpapersByDay).some((items) => items && items.length > 0);
+  const canUseHoldAnywhere =
+    uiMode === "wallpaper" && wallpaperStateHydrated && hasAnyWallpaperRevision;
+  const hasGeneratedWallpaper =
+    uiMode === "wallpaper" && wallpaperStateHydrated && hasAnyWallpaperRevision;
+
   const [showAssets, setShowAssets] = useState(false);
   const [assets, setAssets] = useState<MemoryObjectItem[]>([]);
   const [isLoadingAssets, setIsLoadingAssets] = useState(false);
@@ -51,23 +70,84 @@ export function WallpaperStage() {
   const holdAnywhere = useHoldAnywhereRecorder({
     subjectLiftHeld: isSubjectInteractionActive,
     uiMode,
-    onSwipeCancel: (pointerId) => {
-      // The user clearly swiped horizontally; hand the gesture to the
-      // carousel. We must clear voice ownership SYNCHRONOUSLY here so
-      // the very next pointerMove in the same event sequence is
-      // treated as a carousel drag.
+    enabled: canUseHoldAnywhere,
+    onSwipeCancel: (pointerId, axis) => {
+      // The user clearly swiped horizontally or vertically while holding;
+      // hand the gesture to whichever handler owns that axis. We must clear
+      // voice ownership SYNCHRONOUSLY here so the very next pointerMove in
+      // the same event sequence is treated as a carousel drag (or so the
+      // pointerUp handler can run the vertical gesture logic).
       voiceGestureActiveRef.current = false;
       voiceGesturePointerIdRef.current = null;
       swipeStartXRef.current = swipeStartXRefOnDownRef.current;
       swipeStartYRef.current = swipeStartYRefOnDownRef.current;
       gestureConsumedRef.current = false;
       console.log(
-        "[WallpaperStage] hold→carousel handoff (pointerId=",
-        pointerId,
-        ")",
+        "[WallpaperStage] hold→" + axis + " handoff (pointerId=" + pointerId + ")",
       );
     },
   });
+// Standalone module-level subscription surface — no recorder instance.
+  // We destructure to keep the existing local name `subscribeGenerationSuccess`
+  // so the auto-jump useEffect below needs no changes.
+  const subscribeGenerationSuccess = subscribeGenerationSuccessGlobal;
+  // (Emit side lives in the hook instance created by useHoldAnywhereRecorder.
+  //  Module-level listener storage ensures cross-instance visibility.)
+  // ── Auto-jump to latest after historical generation success ─────────────
+  // When the user records on a historical revision, the backend generates from
+  // the latest. When the new revision arrives via SSE, we must auto-jump to
+  // latest (TODAY_INDEX, newest revision) so the user sees the result.
+  // We subscribe to generation success and track the expected eventSeq.
+  const setCurrentDayIndex = useSceneStore((s) => s.setCurrentDayIndex);
+  const setSelectedRevision = useSceneStore((s) => s.setSelectedRevision);
+  const expectedJumpEventSeqRef = useRef<number>(0);
+
+  // useEffect with no deps: subscribes once on mount, unsubscribes on unmount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const unsubscribe = subscribeGenerationSuccess(
+      (payload: {
+        eventSeq: number;
+        captureId: string;
+        relationshipId: string;
+        isFromHistoricalPage: boolean;
+      }) => {
+        const { eventSeq } = payload;
+        if (eventSeq <= 0) return;
+        console.log("[WallpaperStage] generation success, expecting jump to eventSeq", eventSeq);
+        expectedJumpEventSeqRef.current = eventSeq;
+      },
+    );
+    return unsubscribe;
+  // NOTE: subscribeGenerationSuccess is stable; no need to re-subscribe when it changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // React to wallpapersByDay changes: check if the expected revision has arrived.
+  // NOTE: This effect intentionally has no dependency on holdAnywhere or other
+  // local state — it only cares about store changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const expectedSeq = expectedJumpEventSeqRef.current;
+    if (!expectedSeq) return;
+
+    const todayWallpapers = wallpapersByDay[DAY_LABELS[TODAY_INDEX]] ?? [];
+    const arrived = todayWallpapers.find((w) => w.eventSeq === expectedSeq);
+    if (arrived) {
+      const newIndex = todayWallpapers.indexOf(arrived);
+      console.log("[WallpaperStage] expected revision arrived, auto-jumping to latest", {
+        eventSeq: expectedSeq,
+        newIndex,
+      });
+      expectedJumpEventSeqRef.current = 0;
+      // Jump to TODAY_INDEX + the newest revision (last in the array = latest).
+      setCurrentDayIndex(TODAY_INDEX);
+      setSelectedRevision(TODAY_INDEX, todayWallpapers.length - 1);
+    }
+  // Watch wallpapersByDay so this fires when the new revision appears.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wallpapersByDay]);
+
   // Capture pointerDown coords here so the swipe-cancel callback can
   // hand them to the carousel even if hold-anywhere already reset its
   // own copies.
@@ -80,7 +160,6 @@ export function WallpaperStage() {
   const exitTimerRef = useRef<number | null>(null);
 
   // ── Carousel handle (page data lives after availableWallpapers below) ──
-  const setSelectedRevision = useSceneStore((s) => s.setSelectedRevision);
   const carouselRef = useRef<WallpaperCarouselHandle>(null);
 
   // ── Computed: flat list of wallpapers with real history ─────────────
@@ -218,10 +297,19 @@ export function WallpaperStage() {
       exitTimerRef.current = null;
     }
     const status = holdAnywhere.state.status;
-    if (status === "hold_pending" || status === "recording") {
+    // Halo visibility is bound to the actual recording lifecycle, not to
+    // hold_pending. During the 2s candidate window the user has NOT
+    // committed to recording — no halo, no audio. Halo only appears once
+    // voice has OWNED the pointer (starting after 2s timer, or recording
+    // after start() resolves).
+    if (status === "starting" || status === "recording") {
       setHaloVisible(true);
       setHaloPhase(status === "recording" ? "recording" : "starting");
       setIsSubjectInteractionActive(true);
+    } else if (status === "hold_pending") {
+      // hold_pending = candidate window. Keep halo hidden; idle drag has
+      // no commitment yet.
+      setIsSubjectInteractionActive(false);
     } else if (status === "idle") {
       if (haloVisible) {
         setHaloPhase("exiting");
@@ -382,6 +470,11 @@ export function WallpaperStage() {
     const deltaX = event.clientX - startX;
 
     // ── Vertical gesture ───────────────────────────────────────────
+    // Block all navigation gestures (vertical swipe, carousel paging) when no
+    // generated wallpaper exists yet. The only active input on the pre-first-voice
+    // page is the central recording button.
+    if (!hasGeneratedWallpaper) return;
+
     const isVerticalGesture =
       Math.abs(deltaY) > Math.abs(deltaX) * 1.25;
     if (isVerticalGesture) {
@@ -422,37 +515,45 @@ export function WallpaperStage() {
       onPointerCancelCapture={handlePointerCancelCapture}
     >
       {/* True translate3d Apple-like carousel — every available wallpaper
-          is a stable mounted page. Snap animation drives store commit. */}
-      <WallpaperCarousel
-        ref={carouselRef}
-        pages={carouselPages}
-        initialIndex={safeCarouselIndex}
-        enabled={!isSubjectInteractionActive && uiMode === "wallpaper" && !showAssets}
-        onPageSettled={(visualIndex) => {
-          const page = carouselPages[visualIndex];
-          if (!page) return;
-          setSelectedRevision(page.dayIndex, page.wallpaperIndex);
-          console.log(
-            "[Carousel] settled →",
-            visualIndex,
-            "day=",
-            page.dayIndex,
-            "wall=",
-            page.wallpaperIndex,
-          );
-        }}
-        onDrag={() => {
-          // While dragging, suppress motion layers to save GPU.
-        }}
-        onDragChange={(active) => {
-          // Reflect drag state into isSubjectInteractionActive so motion
-          // / panorama controls pause while user is paging. We use
-          // prev || active because the voice gesture's useEffect will
-          // eventually clear the flag when recording finishes, and we
-          // don't want a transient drag-end to clear it prematurely.
-          setIsSubjectInteractionActive((prev) => prev || active);
-        }}
-      />
+          is a stable mounted page. Shown only after the first shared wallpaper
+          is ready (post-first-voice). Before that, the root background shows the
+          static base environment scene so the user never sees a black screen. */}
+      {hasGeneratedWallpaper ? (
+        <WallpaperCarousel
+          ref={carouselRef}
+          pages={carouselPages}
+          initialIndex={safeCarouselIndex}
+          enabled={!isSubjectInteractionActive && uiMode === "wallpaper" && !showAssets}
+          onPageSettled={(visualIndex) => {
+            const page = carouselPages[visualIndex];
+            if (!page) return;
+            setSelectedRevision(page.dayIndex, page.wallpaperIndex);
+            console.log(
+              "[Carousel] settled →",
+              visualIndex,
+              "day=",
+              page.dayIndex,
+              "wall=",
+              page.wallpaperIndex,
+            );
+          }}
+          onDrag={() => {
+            // While dragging, suppress motion layers to save GPU.
+          }}
+          onDragChange={(active) => {
+            setIsSubjectInteractionActive((prev) => prev || active);
+          }}
+        />
+      ) : (
+        /* Pre-first-voice: show the static base environment scene.
+           The ChatOverlay's CentralRecordingButton is the only active
+           interaction; Hold Anywhere is blocked by enabled=false. */
+        <div
+          className="absolute inset-0 bg-cover bg-center bg-no-repeat"
+          style={{ backgroundImage: `url(${resolveApiAssetUrl(STATIC_BASE_SCENE_PATH)})` }}
+          aria-hidden="true"
+        />
+      )}
       <AtmosphereOverlay
         motionPaused={isSubjectInteractionActive}
         cameraPositionX={cameraPositionX}

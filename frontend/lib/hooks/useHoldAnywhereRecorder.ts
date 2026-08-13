@@ -41,8 +41,14 @@ const SWIPE_HORIZONTAL_THRESHOLD_PX = 22;
  *  rather than vertical / diagonal. */
 const SWIPE_AXIS_RATIO = 1.3;
 
+/** Vertical distance the user must move before we declare a vertical swipe
+ *  intent and cancel the hold. Matches horizontal threshold for symmetry. */
+const SWIPE_VERTICAL_THRESHOLD_PX = 22;
+
+export type HoldAnywhereAxis = "horizontal" | "vertical";
+
 export type HoldAnywhereState = {
-  status: "idle" | "hold_pending" | "recording";
+  status: "idle" | "hold_pending" | "starting" | "recording";
   clientX: number;
   clientY: number;
   source: "hold_anywhere";
@@ -53,10 +59,14 @@ export type UseHoldAnywhereRecorderOptions = {
   subjectLiftHeld: boolean;
   /** Current UI mode — hold-anywhere only active in wallpaper mode. */
   uiMode: "wallpaper" | "white";
+  /** Explicitly enable/disable the hook. Set to false during
+   *  pre-first-voice (initial_voice interactionMode) so the hook
+   *  never claims a pointer even if uiMode === "wallpaper". */
+  enabled?: boolean;
   /** Called when the user clearly swipes and the hold is cancelled,
    *  so the caller (WallpaperStage) can take over gesture ownership.
    *  Receives the pointerId so the caller can verify the sequence. */
-  onSwipeCancel?: (pointerId: number) => void;
+  onSwipeCancel?: (pointerId: number, axis: HoldAnywhereAxis) => void;
 };
 
 export type UseHoldAnywhereRecorderReturn = {
@@ -78,6 +88,7 @@ const HOLD_ANYWHERE_SOURCE = "hold_anywhere" as const;
 export function useHoldAnywhereRecorder({
   subjectLiftHeld,
   uiMode,
+  enabled = true,
   onSwipeCancel,
 }: UseHoldAnywhereRecorderOptions): UseHoldAnywhereRecorderReturn {
   const { start, finishRecording } = useWallpaperVoiceEditRecorder();
@@ -125,6 +136,15 @@ export function useHoldAnywhereRecorder({
       // is recorded (releasedDuringStartRef) and the start resolves are
       // checked against the captured pointerId / sequence id.
       recordingStartedRef.current = true;
+
+      // Halo enters "starting" phase immediately so the user sees feedback
+      // the moment the 2s timer fires (even before start() resolves).
+      setState({
+        status: "starting",
+        clientX,
+        clientY,
+        source: HOLD_ANYWHERE_SOURCE,
+      });
 
       const captureId = crypto.randomUUID();
       const sequenceIdAtStart = pointerIdRef.current;
@@ -238,12 +258,22 @@ export function useHoldAnywhereRecorder({
       if (subjectLiftHeld) return false;
       // Only in wallpaper mode.
       if (uiMode !== "wallpaper") return false;
+      // Block when first-voice is not yet complete (pre-first-voice state).
+      // The caller (WallpaperStage) gates this so the central button owns
+      // all pointer events during initial_voice mode.
+      if (!enabled) return false;
       // Only primary pointer.
       if (!e.isPrimary) return false;
       // Ignore mouse button ≠ left.
       if (e.pointerType === "mouse" && e.button !== 0) return false;
       // Ignore if already recording from somewhere else.
       if (recordingStartedRef.current) return false;
+
+      // Defensive: reset any stale "released during start" flag from a previous
+      // pointer sequence that completed after its start() resolved. Without this,
+      // an extremely delayed resolve from an earlier session could theoretically
+      // bleed into a new session.
+      releasedDuringStartRef.current = false;
 
       pointerIdRef.current = e.pointerId;
       startXRef.current = e.clientX;
@@ -298,18 +328,21 @@ export function useHoldAnywhereRecorder({
         );
       }
 
-      // Gesture arbitration: cancel hold if user clearly swipes horizontally.
-      // Use the START position as anchor (not accumulated delta), matching
-      // the original MOVE_TOLERANCE logic so the user can "escape" a hold
-      // they started by dragging.
+      // Gesture arbitration: cancel hold if user clearly swipes horizontally
+      // or vertically. Once the hold has fired (starting/recording) neither
+      // swipe direction is honored — voice owns the pointer exclusively.
       const dx = e.clientX - startXRef.current;
       const dy = e.clientY - startYRef.current;
 
-      if (
+      const isHorizontalSwipe =
         Math.abs(dx) > SWIPE_HORIZONTAL_THRESHOLD_PX &&
-        Math.abs(dx) > Math.abs(dy) * SWIPE_AXIS_RATIO
-      ) {
-        console.log("[HOLD_ANYWHERE] swipe detected, cancelling hold", {
+        Math.abs(dx) > Math.abs(dy) * SWIPE_AXIS_RATIO;
+      const isVerticalSwipe =
+        Math.abs(dy) > SWIPE_VERTICAL_THRESHOLD_PX &&
+        Math.abs(dy) > Math.abs(dx) * SWIPE_AXIS_RATIO;
+
+      if (isHorizontalSwipe) {
+        console.log("[HOLD_ANYWHERE] horizontal swipe detected, cancelling hold", {
           dx,
           dy,
         });
@@ -318,7 +351,21 @@ export function useHoldAnywhereRecorder({
         setState({ status: "idle", clientX: e.clientX, clientY: e.clientY, source: HOLD_ANYWHERE_SOURCE });
         // Notify the caller so it can take over gesture ownership
         // (carousel paging) using the original pointerDown coordinates.
-        onSwipeCancel?.(e.pointerId);
+        onSwipeCancel?.(e.pointerId, "horizontal");
+        return;
+      }
+
+      if (isVerticalSwipe) {
+        console.log("[HOLD_ANYWHERE] vertical swipe detected, cancelling hold", {
+          dx,
+          dy,
+        });
+        cancelHold();
+        pointerIdRef.current = null;
+        setState({ status: "idle", clientX: e.clientX, clientY: e.clientY, source: HOLD_ANYWHERE_SOURCE });
+        // Notify the caller so it can take over gesture ownership
+        // (Memory Assets / AI Summary) using the original pointerDown coordinates.
+        onSwipeCancel?.(e.pointerId, "vertical");
       }
     },
     [state.status, cancelHold, onSwipeCancel],
