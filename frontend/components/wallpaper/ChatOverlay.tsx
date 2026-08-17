@@ -50,7 +50,7 @@ function backendPortraitUrl(asset: CharacterAsset | null): string {
  * instead of fabricating a fake one.
  *
  * The 2027 backend contract:
- *   - `themeZh` / `themeEn`        → suggestedReplies[0] (one-line theme)
+ *   - `themeZh` / `themeEn`        → stateOneLiner fallback (one-line theme)
  *   - `descriptionZh` / `descriptionEn` → stateOneLiner  (long summary)
  *   - `spatialMode`                         → visualClues (visual context)
  *
@@ -76,7 +76,7 @@ function buildCommunicationSummary(
   return {
     stateOneLiner: description || theme,
     visualClues,
-    suggestedReplies: theme ? [theme] : [],
+    suggestedReplies: [],
     suggestedAction: "",
     avoid: "",
   };
@@ -813,12 +813,21 @@ export function ChatOverlay() {
   const isWhite = uiMode === "white";
   const dayKey = DAY_LABELS[currentDayIndex] ?? "今天";
   const todayMessages = messagesByDay[dayKey] ?? [];
-  const replyContextMessages = todayMessages;
+  const selectedWallpaper = currentDayWallpapers[currentWallpaperIndex];
   const replyTarget =
-    [...replyContextMessages]
-      .reverse()
-      .find((message) => message.from !== viewerRole) ??
-    replyContextMessages.at(-1);
+    selectedWallpaper?.speakerRole === viewerRole
+      ? todayMessages.find(
+          (message) =>
+            message.id === `wallpaper-event-${selectedWallpaper.eventSeq}`,
+        ) ??
+        [...todayMessages]
+          .reverse()
+          .find(
+            (message) =>
+              message.from === viewerRole &&
+              message.text.trim() === selectedWallpaper.transcript?.trim(),
+          )
+      : undefined;
   const replyRequestKey = replyTarget
     ? `${dayKey}:${replyTarget.id}:${replyTarget.text}`
     : "";
@@ -839,17 +848,31 @@ export function ChatOverlay() {
     ]),
   ).slice(0, 2);
   const selectedWallpaperUrl =
-    currentDayWallpapers[currentWallpaperIndex]?.imageUrl ||
+    selectedWallpaper?.imageUrl ||
     (isLatest ? generatedWallpaperUrl : "") ||
     "";
   const relationshipSummary =
-    currentDayWallpapers[currentWallpaperIndex]?.relationshipSummary ||
+    selectedWallpaper?.relationshipSummary ||
     replyTarget?.relationshipSummary;
   // Build the summary from the real backend relationshipSummary carried
   // by the current wallpaper item. Returns null when no real summary is
   // available — the UI renders an empty state in that case (no fake
   // placeholder text).
   const baseSummary = buildCommunicationSummary(relationshipSummary, language);
+  const isCounterpartEvent = Boolean(
+    selectedWallpaper?.speakerRole &&
+      selectedWallpaper.speakerRole !== viewerRole,
+  );
+  const localWaitingSuggestions =
+    language === "zh"
+      ? [
+          "等待你分享自己的近况。",
+          "完成表达后，这里会为你提供沟通建议。",
+        ]
+      : [
+          "Waiting for you to share what is happening in your life.",
+          "After you speak, communication suggestions will appear here.",
+        ];
   const displaySummary: CommunicationSummary | null =
     llmReplySuggestions.length > 0
       ? {
@@ -864,7 +887,7 @@ export function ChatOverlay() {
                   ...llmReplySuggestions,
                   language === "zh"
                     ? "正在生成第二条建议…"
-                    : "Generating another reply…",
+                    : "Generating another suggestion…",
                 ]
               : llmReplySuggestions,
           suggestedAction: baseSummary?.suggestedAction || "",
@@ -874,15 +897,31 @@ export function ChatOverlay() {
         ? {
             stateOneLiner:
               baseSummary?.stateOneLiner ||
-              (language === "zh" ? "正在生成回复建议…" : "Generating a reply…"),
+              (language === "zh"
+                ? "正在生成沟通建议…"
+                : "Generating communication suggestions…"),
             visualClues: baseSummary?.visualClues || "",
             suggestedReplies: [
-              language === "zh" ? "正在生成回复建议…" : "Generating a reply…",
+              language === "zh"
+                ? "正在生成沟通建议…"
+                : "Generating communication suggestions…",
             ],
             suggestedAction: baseSummary?.suggestedAction || "",
             avoid: baseSummary?.avoid || "",
           }
-        : baseSummary;
+        : isCounterpartEvent
+          ? {
+              stateOneLiner:
+                baseSummary?.stateOneLiner ||
+                (language === "zh"
+                  ? "等待你的下一次表达"
+                  : "Waiting for your next message"),
+              visualClues: baseSummary?.visualClues || "",
+              suggestedReplies: localWaitingSuggestions,
+              suggestedAction: "",
+              avoid: "",
+            }
+          : baseSummary;
   const relationshipTheme =
     (language === "zh"
       ? relationshipSummary?.themeZh
@@ -960,7 +999,6 @@ export function ChatOverlay() {
   const handleDownloadWallpaper = async () => {
     if (!selectedWallpaperUrl) return;
 
-    const selectedWallpaper = currentDayWallpapers[currentWallpaperIndex];
     void recordExperimentEvent({
       eventName: "wallpaper.download_requested",
       sceneId: selectedWallpaper?.revisionId || "",
@@ -1103,7 +1141,9 @@ export function ChatOverlay() {
               elderPortraitUrl={elderPortraitUrl}
               language={language}
             />
-            <SummaryAbstractCard summary={displaySummary} />
+            {displaySummary?.suggestedReplies.length ? (
+              <SummaryAbstractCard summary={displaySummary} />
+            ) : null}
             <SummaryChatPreview
               messages={todayMessages}
               dayIndex={currentDayIndex}
